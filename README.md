@@ -3,11 +3,11 @@
 <img width="1314" height="1152" alt="b4bd95e48d0e896e4bcf452df5f408ca" src="https://github.com/user-attachments/assets/bbb5dcb8-95bf-43df-9c95-c401e9f83eae" />
 
 
-╔═════════════════════════════════════╗
-║  二进制帧分析工具(帧析助手) 使用说明   ║
-║  作者: RhycWu                       ║
-║  邮箱: gykjwrq@163.com              ║
-╚═════════════════════════════════════╝
+╔══════╗
+二进制帧分析工具(帧析助手) 使用说明  
+作者: RhycWu                
+邮箱: gykjwrq@163.com       
+╚═════╝
 
 【首次使用】
 
