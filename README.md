@@ -1,7 +1,9 @@
 # serial_and_udp_tool
 帧析助手，一个二进制帧提取工具。其实就是串口和udp数据收发，8通道实时绘图，数据导出工具。原始txt，提取数据excel。
 ![截图](v11截图.png)
+## 下载
 
+- [最新版 exe](https://github.com/ebasegykj/serial_and_udp_tool/releases/latest)
 
 ╔══════╗
 二进制帧分析工具(帧析助手) 使用说明  
