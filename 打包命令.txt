@@ -1,0 +1,9 @@
+
+单文件版本 (py313) 用xpipe cmdpy313 终端执行   命令或者build.bat不会卡100%
+
+python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=tk-inter --windows-icon-from-ico=app.ico --include-data-file=app.ico=app.ico --zig 9.py
+
+upx是用pyinstaller打包体压缩体积插件  压缩后还是大 
+
+打包时候警告 dll 可能是需要老旧电脑如果打不开exe 就安装
+VC++ 2015-2022 Redistributable (x64)
