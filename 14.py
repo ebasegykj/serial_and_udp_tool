@@ -229,6 +229,15 @@ TEXTS = {
         'samples_pkt':     'Smp:',
         'max_points':      'Max Pts:',
         'channels':        'Channels:',
+        # 历史发送弹窗（2026-11-04 补 i18n）
+        'hist_label':      'Last {n} commands (newest at top):',
+        'hist_load':       'Load to Input',
+        'hist_send':       'Send Immediately',
+        'hist_cancel':     'Cancel',
+        # 文件对话框标题
+        'dlg_save_txt':    'Select Save File (TXT)',
+        'dlg_save_csv':    'Select Extracted Data CSV File',
+        'dlg_open_hex':    'Select Hex Data File',
     },
     'zh': {
         # 分组标题
@@ -272,8 +281,113 @@ TEXTS = {
         'samples_pkt':     '样本:',
         'max_points':      '点数:',
         'channels':        '通道数:',
+        # 历史发送弹窗（2026-11-04 补 i18n，按钮文案用户定稿）
+        # 2026-11-04 用户要求：最新在顶部（列表顺序本来就是这样，
+        # 此前说明文字写反成"最新在底部"，误导用户往下滚）
+        'hist_label':      '最近 {n} 条发送记录（最新在顶部）：',
+        'hist_load':       '复制到命令行',
+        'hist_send':       '立即发送',
+        'hist_cancel':     '退出',
+        # 文件对话框标题
+        'dlg_save_txt':    '选择TXT保存文件',
+        'dlg_save_csv':    '选择提取数据CSV保存文件',
+        'dlg_open_hex':    '选择十六进制数据文件',
     },
 }
+
+
+# ==========================================================
+# 弹窗文案本地化（2026-11-03 新增）
+# 原有 28 处弹窗调用全部硬编码英文。为避免逐处改写引入回归，
+# 统一在入口翻译一次：调用点由 messagebox.xxx 换成 mb_xxx 包装，
+# 内部按 _UI_LANG 的当前语言查表；表中没有的字符串原样输出（不吞内容）。
+# 支持最长前缀匹配，用于 "Invalid hex data: xxx" 这类带动态内容的文案。
+# ==========================================================
+_UI_LANG = {'lang': 'zh'}          # 由 FrameAnalyzer._apply_language() 同步
+
+_DIALOG_TEXTS = {
+    'zh': {
+        # — 标题 —
+        'Config':               '配置',
+        'Config Error':         '配置错误',
+        'Error':                '错误',
+        'Serial Error':         '串口错误',
+        'UDP Error':            'UDP 错误',
+        'Connection Error':     '连接错误',
+        'Connection Lost':      '连接已断开',
+        'Send Error':           '发送错误',
+        'History':              '历史发送',
+        'Clipboard':            '剪贴板',
+        'Parse Error':          '解析错误',
+        'Result':               '结果',
+        'Analysis Complete':    '分析完成',
+        # — 正文 —
+        'Frame configuration applied':   '帧配置已应用',
+        'Channel configuration applied': '通道配置已应用',
+        'Select a port first':           '请先选择串口端口',
+        'Invalid baud rate setting':     '波特率设置无效',
+        'Invalid local port number':     '本机端口号无效',
+        'Invalid remote port number':    '远端端口号无效',
+        'Cannot bind to ':               '无法绑定到 ',
+        'Not connected':                 '尚未连接',
+        'Serial port not connected':     '串口未连接',
+        'UDP not connected':             'UDP 未连接',
+        'No remote address.\nSet Remote IP/Port or receive data first.':
+            '没有远端地址。\n请先设置远端 IP/端口，或先接收一次数据。',
+        'Cannot create file: ':          '无法创建文件：',
+        'Clipboard is empty':            '剪贴板为空',
+        'Invalid hex data: ':            '十六进制数据无效：',
+        'No valid frames found':         '未找到有效帧',
+        'No send history yet.':          '暂无发送记录。',
+        'Connection lost: ':             '连接已断开：',
+        # 掉线提示只给结论，不带原始异常串
+        'Serial connection lost':        '串口连接已断开',
+        'UDP connection lost':           'UDP 连接已断开',
+    },
+    'en': {},                      # 英文即原文，无需翻译
+}
+
+
+def _tr_dialog(text, lang):
+    """按当前语言翻译弹窗文案；未命中一律返回原文。"""
+    if lang != 'zh' or not text:
+        return text
+    # 串口打开失败：整段是模板 + 动态端口名，单独拼装
+    if text.startswith("Cannot open serial port '"):
+        parts = text.split("'")
+        port = parts[1] if len(parts) > 1 else ""
+        return ("无法打开串口 '%s'。\n请检查：\n"
+                "1. 端口是否存在（点「刷新」更新列表）\n"
+                "2. 端口是否被其他软件占用\n"
+                "3. USB 线是否连接正常") % port
+    table = _DIALOG_TEXTS.get(lang) or {}
+    if text in table:
+        return table[text]
+    best = None                    # 最长前缀匹配，保留动态后缀
+    for k in table:
+        if text.startswith(k) and (best is None or len(k) > len(best)):
+            best = k
+    if best:
+        return table[best] + text[len(best):]
+    return text
+
+
+def _mb(kind, title, message='', **kw):
+    lang = _UI_LANG.get('lang', 'zh')
+    fn = getattr(messagebox, kind)      # getattr 取值，避免与批量替换互相干扰
+    return fn(_tr_dialog(title, lang), _tr_dialog(message, lang), **kw)
+
+
+def mb_showinfo(title, message='', **kw):
+    return _mb('showinfo', title, message, **kw)
+
+
+def mb_showerror(title, message='', **kw):
+    return _mb('showerror', title, message, **kw)
+
+
+def mb_showwarning(title, message='', **kw):
+    return _mb('showwarning', title, message, **kw)
 
 
 # ==========================================================
@@ -351,15 +465,40 @@ class FrameAnalyzer:
         # 2026-11-03 修复A：显式设置 AppUserModelID，root 创建后、iconbitmap 之前调用
         self._set_app_user_model_id()
 
-        # 当前主题索引（0 = 深色）
+        # 当前主题索引（0 = 深色），1.3 起可由 ui_config.json 恢复上次主题
         self.theme_index = 0
+
+        # ==========================================================
+        # 1.3：界面配置初始化（语言 / 主题 / 折叠状态）
+        # 必须放在 _apply_dark_theme()、设置标题栏、创建控件【之前】读回配置：
+        #   ① 主题若晚于控件创建，启动会先按深色画一遍再变色（明显闪一下）；
+        #   ② 语言若晚于这里的默认值赋值，上次的选择会被 'zh' 覆盖掉。
+        # ==========================================================
+        self._i18n_widgets = []          # [(widget, key, attr), ...]
+        self._collapsible = {}           # key -> {'frame': labelframe, 'body': body}
+        self.language = 'zh'             # 默认中文（ui_config.json 有记录则用记录值）
+        self.collapsed_state = {
+            'connection': False,
+            'datalog':    False,
+            'framecfg':   False,
+        }
+        self._config_path = self._get_config_path()
+        self._load_ui_config()
 
         def get_icon_path():
             # 2026-11-03 用户要求恢复旧版行为：把任意 app.ico 放到 exe 同目录，
             # 软件就用这个图标。因此 exe 同目录优先级最高（用户自定义覆盖），
             # 其次是打包内置（onefile 的临时解包目录），再往下才是脚本/开发目录兜底。
             candidates = []
-            # 1) exe 所在目录（用户自定义图标，优先级最高）
+            # 1) 程序真实所在目录（用户自定义图标，优先级最高）
+            #    2026-11-03 修正：onefile 下 sys.executable 可能指向临时解包目录
+            #    （Nuitka ≤2.6），必须用 _get_app_dir()（基于 argv[0]）拿真实目录，
+            #    否则"放个 app.ico 到 exe 同目录就能换图标"在打包版里失效。
+            try:
+                candidates.append(os.path.join(self._get_app_dir(), "app.ico"))
+            except Exception:
+                pass
+            # 2) 兜底：exe 所在目录（部分环境下 argv[0] 缺失）
             try:
                 candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "app.ico"))
             except Exception:
@@ -413,21 +552,9 @@ class FrameAnalyzer:
         except Exception:
             pass
 
-        # ==========================================================
-        # 1.2 新增（功能2/3/4）：i18n 状态、折叠状态与配置持久化初始化
-        # 2026-11-03 用户要求：启动时一律全部展开，不再按屏幕高度自动折叠，
-        # 也不再从 ui_config.json 恢复折叠状态（折叠仅保留手动点击，默认不藏内容）
-        # ==========================================================
-        self._i18n_widgets = []          # [(widget, key, attr), ...]
-        self._collapsible = {}           # key -> {'frame': labelframe, 'body': body}
-        self.language = 'zh'             # 2026-11-03 用户要求：默认中文（ui_config.json 有记录则用记录值）
-        self.collapsed_state = {
-            'connection': False,
-            'datalog':    False,
-            'framecfg':   False,
-        }
-        self._config_path = self._get_config_path()
-        self._load_ui_config()
+        # 1.3：i18n 与折叠状态已在 __init__ 开头初始化并从 ui_config.json 读回
+        #（见上文“界面配置初始化”，此处不再重复，否则会覆盖已恢复的语言/主题）。
+        # 2026-11-03 用户要求：启动时一律全部展开，折叠状态不再跨启动恢复。
 
         # Serial
         self.serial_port = None
@@ -505,6 +632,15 @@ class FrameAnalyzer:
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         except Exception:
             pass
+
+        # 2026-11-03：启动即写一次配置。原因：只在切换语言/折叠/退出时写，
+        # 若程序被任务管理器强杀、或用户从不切换，就永远看不到文件，
+        # 无法判断"到底写到哪了"。启动时先落一次盘，文件必然存在，
+        # 位置也能立刻确认（exe 同目录 → 脚本目录 → 用户主目录）。
+        # 1.4：写盘前先把上次保存的帧配置/通道配置恢复到界面，
+        # 这样重开软件就是上次的设置（控件此时已全部创建完毕）。
+        self._restore_saved_config()
+        self._save_ui_config()
 
     # ==========================================================
     # 2026-11-03 修复A：AppUserModelID（任务栏分组图标）
@@ -644,7 +780,7 @@ class FrameAnalyzer:
             darkcolor=THEME['panel_2'],
             focuscolor=THEME['accent'],
             relief='flat',
-            padding=(8, 5),
+            padding=(2, 2),
             font=FONT_UI,
         )
         style.map('TButton',
@@ -671,7 +807,7 @@ class FrameAnalyzer:
             lightcolor=THEME['accent'],
             darkcolor=THEME['accent'],
             font=('Microsoft YaHei UI', 9, 'bold'),
-            padding=(8, 5),
+            padding=(2,2),
         )
         style.map('Accent.TButton',
             background=[('active', THEME['accent_2']), ('pressed', THEME['accent_2'])],
@@ -812,6 +948,7 @@ class FrameAnalyzer:
         widget.configure(**{attr: v})。
         1.2 调整1：三个可折叠组的标题按当前折叠状态拼接箭头。
         动态文本（Connect/Disconnect 按钮）按连接状态取词。"""
+        _UI_LANG['lang'] = self.language      # 弹窗翻译层同步当前语言
         for widget, key, attr in list(self._i18n_widgets):
             try:
                 if key in ('connection', 'datalog', 'framecfg'):
@@ -918,45 +1055,154 @@ class FrameAnalyzer:
             pass
 
     # ==========================================================
-    # 1.2 新增（功能3）：ui_config.json 持久化
+    # 1.2 新增（功能3）：配置持久化
     # 路径与图标加载相同的 base 目录逻辑（Nuitka 下 __nuitka_binary_dir__，
-    # 否则脚本目录），文件名 ui_config.json
+    # 否则脚本目录）。2026-11-04：文件名 ui_config.json → .config.json，
+    # Windows 下另加系统隐藏属性（.开头在 Windows 不隐藏）
     # ==========================================================
-    def _get_config_path(self):
-        """界面配置文件位置（2026-11-03 修正）。
-        原实现优先用 __nuitka_binary_dir__，那是 onefile 的【临时解包目录】，
-        进程一退出就被清掉——等于语言/折叠状态没记忆，而且文件藏在你找不到的地方。
-        改为：打包运行 → exe 同目录（可见、可手动删）；源码运行 → 脚本目录；
-        都不可写时回退用户主目录。"""
-        candidates = []
-        try:
-            if getattr(sys, 'frozen', False) or getattr(sys, '__nuitka_binary_dir__', None):
-                candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
-        except Exception:
-            pass
-        try:
-            candidates.append(os.path.dirname(os.path.abspath(__file__)))
-        except Exception:
-            pass
-        try:
-            candidates.append(os.path.expanduser('~'))
-        except Exception:
-            pass
-        for base in candidates:
+    def _get_app_dir(self):
+        """返回“程序真正所在的目录”（2026-11-03 修正第二版）。
+        Nuitka onefile 的路径陷阱（官方文档 + 2.6.x 实测）：
+          ① __file__ 指向 %TEMP%\\onefile_xxx 临时解包目录，进程退出即删；
+          ② Nuitka ≤ 2.6 的 sys.executable 也指向该临时目录（2.7 才改回真实路径）；
+          ③ sys.argv[0] 始终是【被双击的原始 exe 路径】，官方文档明确保证。
+        所以这里以 argv[0] 为首选，并显式排除临时解包目录——
+        这是上一版写出来的 json"哪里都找不到"的根因。"""
+        cands = []
+
+        def _push(p):
             try:
-                if base and os.path.isdir(base) and os.access(base, os.W_OK):
-                    return os.path.join(base, "ui_config.json")
+                if p:
+                    d = os.path.dirname(os.path.abspath(p))
+                    if d and d not in cands:
+                        cands.append(d)
             except Exception:
                 pass
+
+        # ⓪ Nuitka onefile 引导器会把原始 argv[0] 存进这个环境变量
+        #    （OnefileBootstrap.c: setEnvironmentVariable("NUITKA_ORIGINAL_ARGV0", ...)），
+        #    比 argv[0] 更保险：即使某些场景 argv[0] 被改写也不会丢。
+        _push(os.environ.get('NUITKA_ORIGINAL_ARGV0'))
+        _push(sys.argv[0])                      # ① 原始 exe 路径（onefile 唯一可靠）
         try:
-            return os.path.join(os.getcwd(), "ui_config.json")
+            if getattr(sys, 'frozen', False) or getattr(sys, '__nuitka_binary_dir__', None):
+                _push(sys.executable)           # ② 打包运行（2.7+ 才指向真实目录）
+            else:
+                _push(__file__)                 # ③ 源码运行：脚本所在目录
         except Exception:
-            return "ui_config.json"
+            pass
+
+        tmp = ''
+        try:
+            tmp = os.path.abspath(os.environ.get('TEMP') or os.environ.get('TMP') or '')
+        except Exception:
+            pass
+        for d in cands:
+            low = d.lower()
+            if 'onefile_' in low:               # 临时解包目录：写进去等于没写
+                continue
+            if tmp and low.startswith(tmp.lower()):
+                continue
+            if os.path.isdir(d):
+                return d
+        try:
+            return os.path.expanduser('~')
+        except Exception:
+            return os.getcwd()
+
+    def _get_config_path(self):
+        """界面配置文件位置（2026-11-03 修正第二版）。
+        优先级：exe 同目录（可见、可手动删除）→ %LOCALAPPDATA%\\FrameAnalyzer
+        → 用户主目录。任何情况下都不再写临时解包目录。"""
+        def _writable(d):
+            """真实写一次再删掉来判断目录可写。
+            注意：Windows 下 os.access(d, os.W_OK) 对目录判断不可靠
+            （连 C:\\Windows\\System32 都可能返回 True），必须实测。"""
+            test = os.path.join(d, ".ui_cfg_write_test")
+            try:
+                with open(test, 'w', encoding='utf-8') as f:
+                    f.write('x')
+                os.remove(test)
+                return True
+            except Exception:
+                return False
+
+        cands = []
+        try:
+            cands.append(self._get_app_dir())
+        except Exception:
+            pass
+        # 双击运行的当前工作目录通常就是 exe 所在目录。
+        # 放在这里作为第二道保险：即便 onefile 把 argv[0] 也改写成临时路径，
+        # 双击场景仍能写对位置（不可写的目录会被下面的探测自动跳过）。
+        try:
+            cands.append(os.getcwd())
+        except Exception:
+            pass
+        try:
+            local = os.environ.get('LOCALAPPDATA') or os.path.join(
+                os.path.expanduser('~'), 'AppData', 'Local')
+            cands.append(os.path.join(local, 'FrameAnalyzer'))
+        except Exception:
+            pass
+        try:
+            cands.append(os.path.expanduser('~'))
+        except Exception:
+            pass
+
+        for base in cands:
+            try:
+                if not base:
+                    continue
+                if not os.path.isdir(base):
+                    os.makedirs(base, exist_ok=True)
+                if _writable(base):
+                    # 2026-11-04 用户要求：改名为 .config.json 并加 Windows 隐藏属性
+                    return os.path.join(base, ".config.json")
+            except Exception:
+                continue
+        try:
+            return os.path.join(os.getcwd(), ".config.json")
+        except Exception:
+            return ".config.json"
+
+    def _hide_config_file(self, path):
+        """Windows 下给配置文件加系统隐藏属性（资源管理器默认不显示）。
+        注意：.开头文件只在 Linux/Mac 自动隐藏，Windows 必须靠文件属性，
+        所以改名 + 属性两手都做。Linux/Mac 下 .config.json 本身就是隐藏名。"""
+        if sys.platform != 'win32':
+            return
+        try:
+            import ctypes
+            FILE_ATTRIBUTE_HIDDEN = 0x02
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+        except Exception:
+            pass
 
     def _load_ui_config(self):
-        """启动时读取 ui_config.json（只恢复语言）。
+        """启动时读取 .config.json（恢复语言 + 主题，1.3 起支持主题）。
         2026-11-03 用户要求：折叠状态不再跨启动恢复，启动一律全展开；
-        文件中的 collapsed 字段继续写入但不读回，避免旧文件把界面折叠起来。"""
+        文件中的 collapsed 字段继续写入但不读回，避免旧文件把界面折叠起来。
+        2026-11-04：配置文件改名 ui_config.json → .config.json（加隐藏属性），
+        启动时自动把旧文件迁移过来并删除，用户无感。"""
+        # —— 旧配置文件迁移 ——
+        try:
+            if not os.path.exists(self._config_path):
+                legacy_candidates = [
+                    os.path.join(os.path.dirname(self._config_path), "ui_config.json"),
+                    os.path.join(os.path.expanduser('~'), "ui_config.json"),
+                ]
+                for legacy in legacy_candidates:
+                    if os.path.isfile(legacy):
+                        with open(legacy, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        with open(self._config_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        self._hide_config_file(self._config_path)
+                        os.remove(legacy)          # 迁移成功才删旧文件
+                        break
+        except Exception:
+            pass
         try:
             with open(self._config_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -967,22 +1213,189 @@ class FrameAnalyzer:
         lang = data.get('language')
         if lang in ('zh', 'en'):
             self.language = lang
+        # 1.4：保留整份原始配置，供控件创建完成后 _restore_saved_config() 恢复
+        # 帧配置 / 通道配置（此处控件还不存在，只能先存着）
+        self._saved_config = data
+        # 1.3 主题记忆：按主题名匹配（存名字而非索引，日后调整主题顺序不会串）
+        name = data.get('theme')
+        if isinstance(name, str):
+            for idx, (tname, tdict, _icon) in enumerate(THEME_LIST):
+                if tname == name:
+                    self.theme_index = idx
+                    THEME.clear()
+                    THEME.update(tdict)
+                    break
 
-    def _save_ui_config(self):
-        """立即写回 ui_config.json（折叠切换/语言切换时调用，失败静默）"""
+    def _restore_saved_config(self):
+        """1.4：把上次保存的帧配置 / 通道配置恢复到界面（启动时调用一次）。
+        任何一项解析失败都只跳过该项，绝不影响程序启动。"""
+        cfg = getattr(self, '_saved_config', None)
+        if not isinstance(cfg, dict):
+            return
+
+        # ---------- 帧配置 ----------
+        frame = cfg.get('frame')
+        if isinstance(frame, dict):
+            for var_name, key in (('header_var', 'header'),
+                                  ('length_var', 'length'),
+                                  ('order_var', 'order'),
+                                  ('samples_var', 'samples'),
+                                  ('max_pts_var', 'max_points'),
+                                  ('channel_count_var', 'channel_count')):
+                val = frame.get(key)
+                var = getattr(self, var_name, None)
+                if var is not None and val is not None:
+                    try:
+                        var.set(str(val))
+                    except Exception:
+                        pass
+            # 同步运行时帧参数；任一值不合法就整体保持默认，不弹窗打扰启动
+            try:
+                hdr = bytes.fromhex(self.header_var.get().replace(' ', '').replace('\n', ''))
+                ln = int(self.length_var.get())
+                spp = max(1, int(self.samples_var.get()))
+                mp = int(self.max_pts_var.get())
+                order = self.order_var.get()
+                if hdr and ln > 1 and mp > 0 and order in ('big', 'little'):
+                    self.frame_header = hdr
+                    self.frame_length = ln
+                    self.byte_order = order
+                    self.samples_per_packet = spp
+                    self.max_points = mp
+            except Exception:
+                pass
+
+        # ---------- 通道配置 ----------
+        chans = cfg.get('channels')
+        if isinstance(chans, list) and chans:
+            try:
+                n = max(1, min(len(chans), MAX_CHANNELS))
+                new_channels, new_values, new_diff_values, new_visible = [], [], [], []
+                for i in range(n):
+                    c = chans[i] if isinstance(chans[i], dict) else {}
+                    idx = c.get('indices')
+                    if isinstance(idx, str):
+                        try:
+                            idx = self._parse_indices(idx)
+                        except Exception:
+                            idx = None
+                    if not isinstance(idx, list) or not idx:
+                        start_idx = 2 + i * 2          # 与默认通道分配规则一致
+                        idx = [start_idx, start_idx + 1]
+                    try:
+                        sb = int(c.get('sign_bit', -1))
+                    except Exception:
+                        sb = -1
+                    new_channels.append({'indices': idx, 'sign_bit': sb,
+                                         'diff': bool(c.get('diff', False))})
+                    new_values.append(deque(maxlen=self.max_points))
+                    new_diff_values.append(deque(maxlen=self.max_points))
+                    new_visible.append(bool(c.get('visible', True)))
+
+                self.channel_count = n
+                try:
+                    self.channel_count_var.set(str(n))
+                except Exception:
+                    pass
+                self.channels = new_channels
+                self.channel_values = new_values
+                self.channel_diff_values = new_diff_values
+                self.channel_visible = new_visible
+                self._create_channel_widgets()
+                try:
+                    self._update_color_legend()
+                except Exception:
+                    pass
+                try:
+                    self._init_plot_lines()
+                    self._redraw_plot()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _collect_frame_config(self):
+        """收集当前帧配置（控件未创建时返回空 dict，不抛异常）。"""
+        out = {}
+        for key, var_name in (('header', 'header_var'), ('length', 'length_var'),
+                              ('order', 'order_var'), ('samples', 'samples_var'),
+                              ('max_points', 'max_pts_var'),
+                              ('channel_count', 'channel_count_var')):
+            var = getattr(self, var_name, None)
+            if var is None:
+                continue
+            try:
+                out[key] = var.get()
+            except Exception:
+                pass
+        return out
+
+    def _collect_channel_config(self):
+        """收集当前通道配置（用户实际填在界面上的值）。"""
+        out = []
+        for w in getattr(self, 'channel_widgets', []) or []:
+            try:
+                idx_str = w['indices_var'].get().strip()
+                idx = self._parse_indices(idx_str) if idx_str else []
+            except Exception:
+                idx = []
+            try:
+                sb_str = w['sign_bit_var'].get().strip()
+                sb = int(sb_str) if sb_str else -1
+            except Exception:
+                sb = -1
+            try:
+                diff = bool(w['diff_var'].get())
+            except Exception:
+                diff = False
+            try:
+                vis = bool(w['visible_var'].get())
+            except Exception:
+                vis = True
+            out.append({'indices': idx, 'sign_bit': sb, 'diff': diff, 'visible': vis})
+        return out
+
+    def _unhide_config_file(self, path):
+        """2026-11-04 关键修复：写入前摘掉隐藏属性。
+        Windows 对带 FILE_ATTRIBUTE_HIDDEN 的文件执行 open(path, 'w') 会抛
+        PermissionError（CreateFile 的 CREATE_ALWAYS 语义与 HIDDEN 冲突），
+        导致配置永远存不进去、每次启动又被默认值覆盖（v14.exe 实测复现）。
+        所以保存流程必须是：摘属性 → 覆盖写 → 重新隐藏。"""
+        if sys.platform != 'win32':
+            return
         try:
-            data = {
-                'collapsed': {
-                    'connection': bool(self.collapsed_state.get('connection', False)),
-                    'datalog':    bool(self.collapsed_state.get('datalog', False)),
-                    'framecfg':   bool(self.collapsed_state.get('framecfg', False)),
-                },
-                'language': self.language,
-            }
-            with open(self._config_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            import ctypes
+            if os.path.isfile(path):
+                FILE_ATTRIBUTE_NORMAL = 0x80
+                ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_NORMAL)
         except Exception:
             pass
+
+    def _save_ui_config(self):
+        """立即写回 .config.json（启动/折叠切换/语言切换/退出时调用）。
+        首选 self._config_path；写失败（exe 在 Program Files、U 盘只读目录等）
+        时回退用户主目录，保证状态一定能存下来、文件一定找得到。
+        2026-11-04：改名 .config.json 并加 Windows 隐藏属性；
+        同日修复：隐藏文件必须先摘属性再覆盖写（见 _unhide_config_file）。"""
+        data = {
+            # 2026-11-03 用户要求：折叠状态不保存，每次启动一律全部展开。
+            # 因此这里不再写入 collapsed 字段（旧文件里的残留字段也不会被读回）。
+            'language': self.language,
+            'theme': THEME_LIST[self.theme_index][0],
+            'frame': self._collect_frame_config(),
+            'channels': self._collect_channel_config(),
+        }
+        for path in (self._config_path,
+                     os.path.join(os.path.expanduser('~'), '.config.json')):
+            try:
+                self._unhide_config_file(path)      # 隐藏文件直接 'w' 会 PermissionError
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self._config_path = path      # 记住实际成功的路径
+                self._hide_config_file(path)  # Windows 下恢复隐藏（重复设置无害）
+                return
+            except Exception:
+                continue
 
     def _on_close(self):
         """退出前再保存一次配置，然后关闭窗口"""
@@ -1519,6 +1932,13 @@ class FrameAnalyzer:
 
 
 
+        # 11) 1.3：主题记忆——切换后立即写回 ui_config.json（失败静默）
+        try:
+            self._save_ui_config()
+        except Exception:
+            pass
+
+
     def _refresh_widgets_colors(self, widget):
         """递归遍历所有控件，刷新背景色和前景色"""
         cls_name = widget.__class__.__name__
@@ -2000,7 +2420,7 @@ class FrameAnalyzer:
             max_required = max(cfg['indices']) + (samples_per_packet - 1) * sample_size + 1
             if max_required > frame_length:
                 if samples_per_packet > 1:
-                    messagebox.showerror(
+                    mb_showerror(
                         "Config Error",
                         f"通道 CH{i+1} 字节索引越界：\n"
                         f"最大索引 {max(cfg['indices'])}，Samples/Pkt={samples_per_packet} "
@@ -2008,7 +2428,7 @@ class FrameAnalyzer:
                         f"超出帧长 {frame_length}（有效索引范围 0 ~ {frame_length - 1}）。\n"
                         f"请修正该通道的 Idx 或帧配置后重试。")
                 else:
-                    messagebox.showerror(
+                    mb_showerror(
                         "Config Error",
                         f"通道 CH{i+1} 字节索引越界：\n"
                         f"最大索引 {max(cfg['indices'])} 超出帧长 {frame_length}"
@@ -2017,7 +2437,12 @@ class FrameAnalyzer:
                 return False
         return True
 
-    def apply_frame_config(self):
+    def apply_frame_config(self, silent=False):
+        """应用帧配置。
+        silent=True 用于「被 connect()/离线分析内部调用」的场景：成功时不弹
+        「帧配置已应用」，只在失败时弹错。手动点 Apply Frame 按钮时走默认
+        silent=False，保留成功反馈。
+        返回 True/False 表示是否应用成功，供调用方决定是否继续。"""
         try:
             header_str = self.header_var.get().replace(' ', '').replace('\n', '')
             new_header = bytes.fromhex(header_str)
@@ -2032,7 +2457,7 @@ class FrameAnalyzer:
             if not self._validate_channel_indices(self._read_channel_configs_from_ui(),
                                                   frame_length=new_length,
                                                   samples_per_packet=new_spp):
-                return
+                return False
 
             self.frame_header = new_header
             self.frame_length = new_length
@@ -2047,9 +2472,17 @@ class FrameAnalyzer:
             # 修复1：主线程上下文，同步配置快照供接收线程使用
             self._snapshot_channel_configs()
 
-            messagebox.showinfo("Config", "Frame configuration applied")
+            # 1.4：帧配置即时落盘，重开软件自动恢复
+            try:
+                self._save_ui_config()
+            except Exception:
+                pass
+            if not silent:
+                mb_showinfo("Config", "Frame configuration applied")
+            return True
         except Exception as e:
-            messagebox.showerror("Config Error", str(e))
+            mb_showerror("Config Error", str(e))
+            return False
 
     def _on_interface_change(self, event=None):
         if self.is_connected:
@@ -2121,9 +2554,14 @@ class FrameAnalyzer:
             self._init_plot_lines()
             self._redraw_plot()
 
-            messagebox.showinfo("Config", f"Channel configuration applied ({count} channels)")
+            # 1.4：通道配置即时落盘，重开软件自动恢复
+            try:
+                self._save_ui_config()
+            except Exception:
+                pass
+            mb_showinfo("Config", f"Channel configuration applied ({count} channels)")
         except Exception as e:
-            messagebox.showerror("Config Error", str(e))
+            mb_showerror("Config Error", str(e))
 
     def _parse_indices(self, indices_str):
         return [int(x.strip()) for x in re.split(r'[,\s，、]+', indices_str) if x.strip()]
@@ -2213,7 +2651,10 @@ class FrameAnalyzer:
 
     def connect(self):
         try:
-            self.apply_frame_config()
+            # 帧配置/通道配置与串口连接是独立的：apply 失败（配置非法）只弹错
+            # （错误框由 apply_frame_config 内部负责），不阻止连接——沿用最近
+            # 一次有效配置继续收发
+            self.apply_frame_config(silent=True)
             # 修复1：在主线程上下文中生成通道配置快照，供接收线程使用
             self._snapshot_channel_configs()
 
@@ -2234,7 +2675,7 @@ class FrameAnalyzer:
             if self.interface_type == "serial":
                 port = self.port_var.get()
                 if not port:
-                    messagebox.showerror("Error", "Select a port first")
+                    mb_showerror("Error", "Select a port first")
                     return
 
                 port = self._extract_port_name(port)
@@ -2246,7 +2687,7 @@ class FrameAnalyzer:
                         timeout=0.1
                     )
                 except serial.SerialException:
-                    messagebox.showerror("Serial Error",
+                    mb_showerror("Serial Error",
                         "Cannot open serial port '" + port + "'.\n"
                         "Please check:\n"
                         "1. The port exists (click Refresh to update list)\n"
@@ -2254,7 +2695,7 @@ class FrameAnalyzer:
                         "3. The USB cable is properly connected")
                     return
                 except ValueError:
-                    messagebox.showerror("Serial Error", "Invalid baud rate setting")
+                    mb_showerror("Serial Error", "Invalid baud rate setting")
                     return
 
                 self.is_connected = True
@@ -2269,7 +2710,7 @@ class FrameAnalyzer:
                 try:
                     local_port = int(self.udp_local_port_var.get())
                 except ValueError:
-                    messagebox.showerror("UDP Error", "Invalid local port number")
+                    mb_showerror("UDP Error", "Invalid local port number")
                     return
 
                 try:
@@ -2277,7 +2718,7 @@ class FrameAnalyzer:
                     self.udp_socket.bind((local_ip, local_port))
                     self.udp_socket.settimeout(0.1)
                 except OSError as e:
-                    messagebox.showerror("UDP Error", "Cannot bind to " + local_ip + ":" + str(local_port) + ":\n" + str(e))
+                    mb_showerror("UDP Error", "Cannot bind to " + local_ip + ":" + str(local_port) + ":\n" + str(e))
                     if self.udp_socket:
                         try:
                             self.udp_socket.close()
@@ -2292,7 +2733,7 @@ class FrameAnalyzer:
                     try:
                         self.udp_remote_addr = (remote_ip, int(remote_port_str))
                     except ValueError:
-                        messagebox.showerror("UDP Error", "Invalid remote port number")
+                        mb_showerror("UDP Error", "Invalid remote port number")
                         self.udp_socket.close()
                         self.udp_socket = None
                         return
@@ -2308,7 +2749,7 @@ class FrameAnalyzer:
 
             self._start_plot_update()
         except Exception as e:
-            messagebox.showerror("Connection Error", str(e))
+            mb_showerror("Connection Error", str(e))
 
     def disconnect(self):
         self.stop_event.set()
@@ -2363,16 +2804,26 @@ class FrameAnalyzer:
 
     def _on_link_lost(self, reason):
         """修复4：接收线程异常退出时由主线程调用（root.after 调度）：
-        弹窗提示连接断开原因，并复用 disconnect() 复位按钮和状态栏。
+        复位按钮和状态栏，并提示用户连接已断开。
+        弹窗只给结论——原始异常串（ClearCommError / PermissionError 等）对
+        用户没有任何意义，只留作诊断输出（status 里也不放，避免撑爆状态栏）。
         仅在 is_connected 为 True 时执行，避免与正常断开流程重入。"""
         if not self.is_connected:
             return
-        messagebox.showwarning("Connection Lost", f"连接已断开：{reason}")
-        self.disconnect()
+        self.disconnect()                      # 先复位按钮/状态，再弹窗
+        is_udp = getattr(self, 'interface_type', 'serial') == 'udp'
+        msg = "UDP connection lost" if is_udp else "Serial connection lost"
+        self.status_var.set(_tr_dialog(msg, self.language))
+        # 原始异常串只用于排查，不进界面
+        try:
+            print("[link lost] %s" % reason)
+        except Exception:
+            pass
+        mb_showwarning("Connection Lost", msg)
 
     def send_data(self):
         if not self.is_connected:
-            messagebox.showerror("Error", "Not connected")
+            mb_showerror("Error", "Not connected")
             return
 
         try:
@@ -2383,22 +2834,22 @@ class FrameAnalyzer:
             else:
                 data = data_str.encode('ascii', errors='replace')
         except ValueError as e:
-            messagebox.showerror("Error", f"Invalid hex data: {e}")
+            mb_showerror("Error", f"Invalid hex data: {e}")
             return
 
         try:
             if self.interface_type == "serial":
                 if not self.serial_port or not self.serial_port.is_open:
-                    messagebox.showerror("Error", "Serial port not connected")
+                    mb_showerror("Error", "Serial port not connected")
                     return
                 self.serial_port.write(data)
 
             elif self.interface_type == "udp":
                 if not self.udp_socket:
-                    messagebox.showerror("Error", "UDP not connected")
+                    mb_showerror("Error", "UDP not connected")
                     return
                 if not self.udp_remote_addr:
-                    messagebox.showerror("Error",
+                    mb_showerror("Error",
                         "No remote address.\n"
                         "Set Remote IP/Port or receive data first.")
                     return
@@ -2416,7 +2867,7 @@ class FrameAnalyzer:
                 if len(self.send_history) > self.max_history:
                     self.send_history.pop(0)
         except Exception as e:
-            messagebox.showerror("Send Error", str(e))
+            mb_showerror("Send Error", str(e))
 
     def clear_tx_log(self):
         self.tx_count = 0
@@ -2434,12 +2885,14 @@ class FrameAnalyzer:
 
     def show_send_history(self):
         if not self.send_history:
-            messagebox.showinfo("History", "No send history yet.")
+            mb_showinfo("History", "No send history yet.")
             return
 
         dlg = tk.Toplevel(self.root)
         self._apply_dialog_icon(dlg)
-        dlg.title("Send History")
+        # 2026-11-04：弹窗文案纳入 i18n（此前只有 messagebox 包装层翻译，
+        # 这个 Toplevel 弹窗内的标题/标签/按钮全是硬编码英文）
+        dlg.title(self.tr('history'))
         dlg.geometry("500x400")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -2448,7 +2901,7 @@ class FrameAnalyzer:
         frame = tk.Frame(dlg, padx=10, pady=10, bg=THEME['bg'])
         frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text=f"Last {len(self.send_history)} commands (newest at bottom):",
+        tk.Label(frame, text=self.tr('hist_label').format(n=len(self.send_history)),
                 bg=THEME['bg'], fg=THEME['text_dim'], font=FONT_UI).pack(anchor=tk.W)
 
         list_frame = tk.Frame(frame, bg=THEME['bg'])
@@ -2500,13 +2953,14 @@ class FrameAnalyzer:
         btn_frame = tk.Frame(frame, bg=THEME['bg'])
         btn_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Button(btn_frame, text="Load to Input", command=on_select).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Send Immediately", command=on_send).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text=self.tr('hist_load'), command=on_select).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=self.tr('hist_send'), command=on_send).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text=self.tr('hist_cancel'), command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
 
         if self.send_history:
             listbox.selection_set(0)
             listbox.activate(0)
+            listbox.see(0)                # 视图对准顶部（最新一条）
 
     def show_help(self):
         dlg = tk.Toplevel(self.root)
@@ -2645,7 +3099,7 @@ class FrameAnalyzer:
 
     def select_save_file(self):
         filepath = filedialog.asksaveasfilename(
-            title="Select Save File",
+            title=self.tr('dlg_save_txt'),
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("Hex files", "*.hex"), ("All files", "*.*")]
         )
@@ -2653,11 +3107,16 @@ class FrameAnalyzer:
             self.auto_save_file = filepath
             # 1.2 修复：长路径只显示尾部，悬停看完整路径，防止撑爆布局
             self.save_file_label.config(text=self._short_path(filepath), foreground=THEME['text'])
-            try:
-                with open(filepath, 'w') as f:
-                    pass
-            except Exception as e:
-                messagebox.showerror("Error", f"Cannot create file: {e}")
+            # 2026-11-04 bug 修复：原版这里无条件 open(filepath, 'w') 空写一次
+            # （本意是提前建文件），副作用是同名旧文件当场被清空——与 CSV 侧
+            # "选路径不碰文件"的行为不一致。改为：已存在就不碰（数据继续追加），
+            # 不存在才创建空文件。
+            if not os.path.exists(filepath):
+                try:
+                    with open(filepath, 'w') as f:
+                        pass
+                except Exception as e:
+                    mb_showerror("Error", f"Cannot create file: {e}")
 
     def toggle_extracted_save(self):
         self.extracted_save_enabled = self.extracted_save_var.get()
@@ -2669,7 +3128,7 @@ class FrameAnalyzer:
 
     def select_extracted_save_file(self):
         filepath = filedialog.asksaveasfilename(
-            title="Select Extracted Data CSV File",
+            title=self.tr('dlg_save_csv'),
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")]
         )
@@ -2968,7 +3427,7 @@ class FrameAnalyzer:
 
     def load_file(self):
         filepath = filedialog.askopenfilename(
-            title="Select Hex Data File",
+            title=self.tr('dlg_open_hex'),
             filetypes=[("Text files", "*.txt"), ("Hex files", "*.hex"), ("All files", "*.*")]
         )
         if not filepath:
@@ -2978,20 +3437,22 @@ class FrameAnalyzer:
                 content = f.read()
             self._analyze_hex_string(content)
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            mb_showerror("Error", str(e))
 
     def analyze_clipboard(self):
         try:
             content = self.root.clipboard_get()
             self._analyze_hex_string(content)
         except tk.TclError:
-            messagebox.showwarning("Clipboard", "Clipboard is empty")
+            mb_showwarning("Clipboard", "Clipboard is empty")
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            mb_showerror("Error", str(e))
 
     def _analyze_hex_string(self, hex_str):
         try:
-            self.apply_frame_config()
+            # 静默应用：离线绘图已有自己的结果弹窗，不再叠「帧配置已应用」；
+            # 应用失败（配置非法）只弹错，分析继续用最近一次有效配置
+            self.apply_frame_config(silent=True)
         except:
             pass
 
@@ -3002,7 +3463,7 @@ class FrameAnalyzer:
             hex_str = re.sub(r'[\s\r\n]+', '', hex_str)
             data = bytes.fromhex(hex_str)
         except ValueError as e:
-            messagebox.showerror("Parse Error", f"Invalid hex data: {e}")
+            mb_showerror("Parse Error", f"Invalid hex data: {e}")
             return
 
         header_len = len(self.frame_header)
@@ -3016,7 +3477,7 @@ class FrameAnalyzer:
                 i += 1
 
         if not frames:
-            messagebox.showinfo("Result", "No valid frames found")
+            mb_showinfo("Result", "No valid frames found")
             return
 
         active_channels = [i for i, cfg in enumerate(channel_configs) if i < self.channel_count and cfg['active']]
@@ -3089,19 +3550,31 @@ class FrameAnalyzer:
         self.canvas.draw()
 
         active_count = sum(1 for cfg in channel_configs if cfg['active'])
-        msg = f"Found {len(frames)} frames\n"
-        msg += f"Active channels: {active_count}\n\n"
+        # 2026-11-03：分析结果弹窗按当前语言拼装（内容动态，无法靠词典翻译）
+        _zh = (self.language == 'zh')
+        if _zh:
+            msg = "共找到 %d 帧\n" % len(frames)
+            msg += "激活通道：%d\n\n" % active_count
+        else:
+            msg = "Found %d frames\n" % len(frames)
+            msg += "Active channels: %d\n\n" % active_count
 
         for i in range(self.channel_count):
             cfg = channel_configs[i] if i < len(channel_configs) else {'active': False}
             if cfg['active'] and channel_results[i]:
                 vals = channel_results[i]
-                msg += f"CH{i+1}: {len(vals)} values\n"
-                msg += f"  Range: {min(vals)} ~ {max(vals)}\n"
-                msg += f"  First: {vals[0]} (0x{vals[0] & 0xFFFF:04X})\n"
-                msg += f"  Last: {vals[-1]} (0x{vals[-1] & 0xFFFF:04X})\n\n"
+                if _zh:
+                    msg += "通道 CH%d：%d 个数值\n" % (i + 1, len(vals))
+                    msg += "  范围：%d ~ %d\n" % (min(vals), max(vals))
+                    msg += "  首值：%d (0x%04X)\n" % (vals[0], vals[0] & 0xFFFF)
+                    msg += "  末值：%d (0x%04X)\n\n" % (vals[-1], vals[-1] & 0xFFFF)
+                else:
+                    msg += f"CH{i+1}: {len(vals)} values\n"
+                    msg += f"  Range: {min(vals)} ~ {max(vals)}\n"
+                    msg += f"  First: {vals[0]} (0x{vals[0] & 0xFFFF:04X})\n"
+                    msg += f"  Last: {vals[-1]} (0x{vals[-1] & 0xFFFF:04X})\n\n"
 
-        messagebox.showinfo("Analysis Complete", msg)
+        mb_showinfo("Analysis Complete", msg)
 
 
 if __name__ == "__main__":
