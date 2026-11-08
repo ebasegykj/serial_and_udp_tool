@@ -1,0 +1,29 @@
+[package]
+name = "frameanalyzer"
+version = "0.1.0"
+edition = "2021"
+description = "帧析助手 core：帧同步 / 通道提取 / 配置（与 Python 版语义对齐）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+serialport = "4"
+rfd = "0.14"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["ico"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[build-dependencies]
+winresource = "0.1"
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+[profile.release]
+opt-level = 2

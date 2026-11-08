@@ -1,0 +1,39 @@
+# 编译产物（体积大头，删了会自动重建）
+target/
+**/target/
+
+# 程序运行时生成：个人设置 / 导出数据，不是源码
+.config.json
+ui_style.json
+extracted*.csv
+raw.txt
+
+# 对拍 / 诊断临时数据
+_parity_in.json
+_parity_out.json
+
+# exe 与压缩包走 GitHub Releases 分发，不进仓库
+*.exe
+*.zip
+*.rar
+*.7z
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 图片、视频等资源统一放 legacy-python 分支；main 保持纯源码
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.mp4
+*.mov
+*.avi
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
