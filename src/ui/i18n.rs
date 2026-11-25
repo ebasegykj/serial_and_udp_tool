@@ -114,6 +114,16 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("send_err", "发送失败", "Send failed"),
     ("no_ports", "未发现串口设备", "No serial ports found"),
     ("channel_applied", "通道配置已应用", "Channel applied"),
+    // —— 回环测试（配合循环码丢帧统计，检查线路/透传设备是否丢帧） ——
+    ("loopback_test", "回环测试", "Loopback"),
+    ("loopback_running", "回环测试中", "Loopback running"),
+    ("loopback_tip", "勾选后点 ▶ 自动循环发送造出来的帧，点 ⏸ 停止；不使用下方命令列表", "When checked, ▶ sends generated frames in a loop and ⏸ stops; the command list is not used"),
+    ("loopback_hint", "回环测试模式：不使用下方命令列表，按帧头和帧长自动造帧循环发送。", "Loopback mode: the command list is not used; frames are generated from header and length in a loop."),
+    ("loopback_setup_tip", "回环测试前请设：校验=no、循环码位置=帧长（1 起算，最后一字节）、位宽=8，否则循环码统计不会工作。", "Before loopback set: checksum=no, cycle position=frame length (1-based, last byte), width=8; otherwise cycle stats won't work."),
+    ("loopback_help", "11. 回环测试：命令发送窗口勾选「回环测试」后点 ▶，软件只按帧头+帧长造帧（最后一字节循环码 0→255→0）循环发出，配合循环码丢帧计数检查线路/透传设备是否丢帧；断连自动停；需先把校验设为 no、循环码位置设为帧长（末字节）、位宽设为 8。", "11. Loopback: check Loopback in the command window and press ▶; the app generates frames from header+length (last byte is a cycle code 0→255→0) in a loop and works with the cycle-loss counter to detect dropped frames; auto-stops on disconnect; set checksum=no, cycle position=frame length (last byte), width=8 first."),
+    ("loopback_hdr_err", "回环测试帧头错误", "Loopback header error"),
+    ("loopback_len_err", "回环测试帧长错误", "Loopback length error"),
+    ("loopback_bad_len", "回环测试帧长太小（须大于帧头长度+1）", "Loopback frame too short (must exceed header length + 1)"),
 ];
 
 /// 查文案；缺 key 返回 key 本身（便于发现遗漏）。

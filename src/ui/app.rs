@@ -245,9 +245,17 @@ pub struct FrameApp {
     /// 下次循环发送的时刻
     pub cmd_next_send: Option<Instant>,
 
+    // —— 回环测试（造帧循环发送，配合循环码丢帧统计） ——
+    /// 是否启用回环测试：勾选后 ▶ 发「帧头+00填充+循环码」的造帧，不使用命令列表。
+    pub loopback_enabled: bool,
+    /// 回环帧末字节的循环码值（0..=255 回绕）。
+    pub loopback_code: u8,
+
     // —— 状态栏（按功能区块分格，格内互斥、格间独立） ——
     /// 「最近操作」回执：离线分析 / 剪贴板 / 清零 / 主题 / 发送 / 命令等一次性提示。
     pub status_msg: String,
+    /// status_msg 的设置时刻：一次性提示约 3 秒后自动消失。
+    pub status_msg_at: Option<Instant>,
     /// 连接格：非空时取代常驻「已连接/未连接」（串口错误、掉线原因）；状态变化时清空。
     pub link_msg: String,
     /// 帧配置格：应用成功或配置错误，一直留到下次应用（存状态，显示时翻译）。
@@ -394,7 +402,10 @@ impl FrameApp {
             cmd_loop: false,
             cmd_loop_idx: 0,
             cmd_next_send: None,
+            loopback_enabled: false,
+            loopback_code: 0,
             status_msg: String::new(),
+            status_msg_at: None,
             link_msg: String::new(),
             frame_msg: ConfigReceipt::None,
             channel_msg: ConfigReceipt::None,
@@ -652,6 +663,20 @@ impl FrameApp {
         ))
     }
 
+    /// 🗑 清空绘图：重建引擎（同时清帧数/校验错/丢帧/跳变/波形）、清绘图快照，
+    /// 并把 TX 计数一并归零。帧配置非法时 build_engine 失败、保留旧引擎，但快照与 TX
+    /// 仍照旧清空（与原按钮行为一致：不论重建是否成功都清）。
+    fn clear_plot(&mut self) {
+        if let Ok(e) = self.build_engine() {
+            self.engine = e;
+        }
+        // 快照一并清空：暂停时点清空也应是空图
+        self.plot_snapshot_vals.clear();
+        self.plot_snapshot_dif.clear();
+        // 用户确认：TX 计数没有别的清零入口，随「清空绘图」一并归零。
+        self.tx_count = 0;
+    }
+
     /// 生成绘图 series。
     /// - 暂停时数据源为快照（plot_snapshot_*，含冻结的帧号基准），否则为引擎实时值。
     /// - 每个可见通道先推原始线 `Some("CHn")`（进图例）；
@@ -752,20 +777,20 @@ impl FrameApp {
         match parse_header_hex(hex_str) {
             Ok(data) => {
                 if data.is_empty() {
-                    self.status_msg = "离线分析: 数据为空".into();
+                    self.set_status("离线分析: 数据为空");
                     return;
                 }
                 self.engine.rx_buffer.extend_from_slice(&data);
                 self.engine.process_buffer();
                 self.trim_buffers();
                 self.view_plot = true;
-                self.status_msg = format!(
+                self.set_status(format!(
                     "离线分析完成: 帧 {} 样本 {}",
                     self.engine.frame_count, self.engine.sample_count
-                );
+                ));
             }
             Err(e) => {
-                self.status_msg = format!("解析错误: {}", e);
+                self.set_status(format!("解析错误: {}", e));
             }
         }
     }
@@ -778,7 +803,7 @@ impl FrameApp {
         {
             match std::fs::read_to_string(&path) {
                 Ok(content) => self.analyze_hex_string(&content),
-                Err(e) => self.status_msg = format!("读取失败: {}", e),
+                Err(e) => self.set_status(format!("读取失败: {}", e)),
             }
         }
     }
@@ -787,12 +812,12 @@ impl FrameApp {
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => {
                 if text.trim().is_empty() {
-                    self.status_msg = "剪贴板为空".into();
+                    self.set_status("剪贴板为空");
                 } else {
                     self.analyze_hex_string(&text);
                 }
             }
-            Err(_) => self.status_msg = "剪贴板不可用或为空".into(),
+            Err(_) => self.set_status("剪贴板不可用或为空"),
         }
     }
 
@@ -1127,7 +1152,7 @@ impl FrameApp {
             .clicked()
         {
             self.style.cycle_theme();
-            self.status_msg = format!("主题: {}", self.style.theme().name);
+            self.set_status(format!("主题: {}", self.style.theme().name));
             let _ = self.style.save(); // 立即记住，下次启动沿用
             self.save_config(); // 主题也写进 .config.json
         }
@@ -1692,7 +1717,7 @@ impl FrameApp {
         // 清掉计数 + 上一帧基准，下一帧重新起算；软件不猜回退，由人主动清零。
         if reset_pressed.get() {
             self.engine.cycle_reset();
-            self.status_msg = reset_done.to_string();
+            self.set_status(reset_done);
         }
     }
 
@@ -1743,7 +1768,7 @@ impl FrameApp {
             match parse_header_hex(text) {
                 Ok(b) => b,
                 Err(e) => {
-                    self.status_msg = format!("{}: {}", tr(self.lang, "send_err"), e);
+                    self.set_status(format!("{}: {}", tr(self.lang, "send_err"), e));
                     return;
                 }
             }
@@ -1754,7 +1779,7 @@ impl FrameApp {
             let ip = self.udp_remote_ip.trim();
             let port = self.udp_remote_port.trim();
             if ip.is_empty() || port.is_empty() {
-                self.status_msg = format!("{}: 远端IP/端口未设置", tr(self.lang, "send_err"));
+                self.set_status(format!("{}: 远端IP/端口未设置", tr(self.lang, "send_err")));
                 return;
             }
             Some(format!("{}:{}", ip, port))
@@ -1771,17 +1796,68 @@ impl FrameApp {
                     }
                 }
             }
-            Err(e) => self.status_msg = format!("{}: {}", tr(self.lang, "send_err"), e),
+            Err(e) => self.set_status(format!("{}: {}", tr(self.lang, "send_err"), e)),
         }
     }
 
-    /// 命令列表循环发送计时：到点发下一条（轮转），未连接自动停。
+    /// 造一帧回环测试数据：帧头（header_text）+ 若干 00 填充 + 末字节循环码（0→255→0）。
+    /// 只看帧头与帧长：不生成校验字节、不看 HEX/ASCII 开关，直接发原始字节。
+    /// 帧长必须 > 帧头长度 + 1（至少要留一个 00 和一个循环码字节），否则明确报错不 panic。
+    fn next_loopback_frame(&mut self) -> Result<Vec<u8>, String> {
+        let header = parse_header_hex(&self.header_text)
+            .map_err(|e| format!("{}: {}", tr(self.lang, "loopback_hdr_err"), e))?;
+        let length: usize = self
+            .length_text
+            .trim()
+            .parse()
+            .map_err(|_| format!("{}: {}", tr(self.lang, "loopback_len_err"), self.length_text))?;
+        if length <= header.len() + 1 {
+            return Err(format!(
+                "{}: {} <= {} + 1",
+                tr(self.lang, "loopback_bad_len"),
+                length,
+                header.len()
+            ));
+        }
+        let mut data = header;
+        data.resize(length - 1, 0x00);
+        data.push(self.loopback_code);
+        self.loopback_code = self.loopback_code.wrapping_add(1);
+        Ok(data)
+    }
+
+    /// 直接发原始字节（回环造帧专用）：不编码、不记历史，仅按链路目标发送并计 TX。
+    fn send_raw_bytes(&mut self, data: &[u8]) {
+        let target = if self.link_kind == LinkKind::Udp {
+            let ip = self.udp_remote_ip.trim();
+            let port = self.udp_remote_port.trim();
+            if ip.is_empty() || port.is_empty() {
+                self.set_status(format!("{}: 远端IP/端口未设置", tr(self.lang, "send_err")));
+                return;
+            }
+            Some(format!("{}:{}", ip, port))
+        } else {
+            None
+        };
+        match send_bytes(&self.handle, data, target.as_deref()) {
+            Ok(_) => self.tx_count += 1,
+            Err(e) => self.set_status(format!("{}: {}", tr(self.lang, "send_err"), e)),
+        }
+    }
+
+    /// 命令列表 / 回环测试循环发送计时：到点发下一条，未连接自动停。
+    /// 回环模式忽略空命令列表、发 next_loopback_frame() 造的帧；普通模式轮发命令列表。
     /// 在 ui() 每帧调用（egui 即时模式，无需额外线程）。
     fn poll_cmd_loop(&mut self) {
         if !self.cmd_loop {
             return;
         }
-        if !self.connected || self.cmd_list.is_empty() {
+        if !self.connected {
+            self.cmd_loop = false;
+            return;
+        }
+        // 回环模式允许空命令列表；普通模式空列表自动停。
+        if !self.loopback_enabled && self.cmd_list.is_empty() {
             self.cmd_loop = false;
             return;
         }
@@ -1790,10 +1866,21 @@ impl FrameApp {
             .map(|t| Instant::now() >= t)
             .unwrap_or(true);
         if due {
-            let idx = self.cmd_loop_idx.min(self.cmd_list.len() - 1);
-            let text = self.cmd_list[idx].clone();
-            self.send_payload(&text, false);
-            self.cmd_loop_idx = (idx + 1) % self.cmd_list.len();
+            if self.loopback_enabled {
+                match self.next_loopback_frame() {
+                    Ok(data) => self.send_raw_bytes(&data),
+                    Err(msg) => {
+                        // 帧头/帧长配错：停循环并把明确错误放进「最近操作」格。
+                        self.set_status(msg);
+                        self.cmd_loop = false;
+                    }
+                }
+            } else {
+                let idx = self.cmd_loop_idx.min(self.cmd_list.len() - 1);
+                let text = self.cmd_list[idx].clone();
+                self.send_payload(&text, false);
+                self.cmd_loop_idx = (idx + 1) % self.cmd_list.len();
+            }
             self.cmd_next_send =
                 Some(Instant::now() + Duration::from_millis(self.cmd_interval_ms.max(10) as u64));
         }
@@ -1978,6 +2065,20 @@ impl FrameApp {
     /// 按功能区块分格：格内互斥（后一条换掉前一条是合理的），格间独立、互不覆盖。
     /// 抽成纯数据便于单测断言顺序与口径。
     /// 记录中指示灯是独立 widget（不进本数组），便于保持本数组单测的简单断言。
+    /// 统一设置「最近操作」回执并打时间戳（约 3 秒后自动消失）。
+    /// 所有一次性提示都走这里，避免遗漏时间戳导致常驻。
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = msg.into();
+        self.status_msg_at = Some(Instant::now());
+    }
+
+    /// 一次性回执是否已过期（约 3 秒）。未打时间戳的（如测试直接赋值）视为未过期。
+    fn status_msg_expired(&self) -> bool {
+        self.status_msg_at
+            .map(|t| t.elapsed() >= Duration::from_secs(3))
+            .unwrap_or(false)
+    }
+
     fn status_cells(&self) -> Vec<String> {
         let dash = "—".to_string();
         // ①连接格：一次性连接错误优先，否则回落到常驻「已连接/未连接」
@@ -2009,8 +2110,14 @@ impl FrameApp {
         };
         // ⑩跳变（循环码跳号累计）：常驻显示，0 也显示
         let jumps = format!("{} {}", tr(self.lang, "cycle_jumps_short"), self.engine.cycle_jumps);
-        // ⑪最近操作：离线/剪贴板/清零/主题/发送/命令等一次性回执
-        let recent = if self.status_msg.is_empty() { dash } else { self.status_msg.clone() };
+        // ⑪最近操作：回环测试运行中固定显示「回环测试中」；其余一次性回执约 3 秒后消失。
+        let recent = if self.loopback_enabled && self.cmd_loop {
+            tr(self.lang, "loopback_running").to_string()
+        } else if self.status_msg.is_empty() || self.status_msg_expired() {
+            dash
+        } else {
+            self.status_msg.clone()
+        };
         let tx = format!("TX: {}", self.tx_count);
         vec![conn, frame_cfg, channel_cfg, chan_info, sync, chk, lost, frames, jumps, recent, tx]
     }
@@ -2269,8 +2376,9 @@ impl FrameApp {
                 ui.label("3. 通道配置：填通道数点「应用」，每行 Idx 填字节索引（支持 , 空格 中文逗号 顿号），± 为符号位(-1=无，Idx 填完自动算)，Dif 勾选=原始线+差分虚线叠加；");
                 ui.label("4. 离线绘图：帧配置好后点「载入文件」或「分析剪贴板」，把 hex 文本直接绘图；");
                 ui.label("5. 数据记录：勾选提取数据保存(CSV)/原始数据保存(TXT)，未选文件时自动弹出保存对话框；路径标签悬停可看完整路径；");
-                ui.label("6. 绘图工具栏：🏠 恢复原视图、➕/➖ 缩放、🗑 清空、⏸ 暂停绘图（数据照常解析，暂停时显示数据点圆点），▶ 恢复实时；");
+                ui.label("6. 绘图工具栏：🏠 恢复原视图、➕/➖ 缩放、🗑 清空（顺带把 TX 计数归零）、⏸ 暂停绘图（数据照常解析，暂停时显示数据点圆点），▶ 恢复实时；");
                 ui.label("7. 命令发送：手动填若干条命令，设间隔(ms)后 ▶ 自动循环轮发，或逐条点「发送」；HEX/ASCII 跟随发送行格式开关；");
+                ui.label(tr(self.lang, "loopback_help"));
                 ui.label("8. 配置自动保存：帧配置/通道配置/语言/主题/波特率/校验位/命令列表存 exe 同目录 .config.json，退出和应用时写回，重启自动恢复；");
                 ui.label("9. 🌙 循环切换 8 套主题（深色→原始→淡绿→淡蓝→米黄→粉色→Mac→Win），窗口标题栏跟随（Win11）；");
                 ui.label("10. F12 界面微调：左栏宽度，保存到 ui_style.json。");
@@ -2297,27 +2405,27 @@ impl FrameApp {
                             .range(10..=600000)
                             .suffix(" ms"),
                     );
+                    ui.checkbox(&mut self.loopback_enabled, tr(self.lang, "loopback_test"))
+                        .on_hover_text(tr(self.lang, "loopback_tip"));
                     if self.cmd_loop {
                         if ui.add(egui::Button::new("⏸")).on_hover_text(tr(self.lang, "cmd_stop")).clicked() {
                             self.cmd_loop = false;
                         }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} #{}",
-                                tr(self.lang, "cmd_sending"),
-                                self.cmd_loop_idx + 1
-                            ))
-                            .color(self.style.accent_color()),
-                        );
+                        let sending = if self.loopback_enabled {
+                            tr(self.lang, "loopback_running").to_string()
+                        } else {
+                            format!("{} #{}", tr(self.lang, "cmd_sending"), self.cmd_loop_idx + 1)
+                        };
+                        ui.label(egui::RichText::new(sending).color(self.style.accent_color()));
                     } else if ui
                         .add(egui::Button::new("▶"))
                         .on_hover_text(tr(self.lang, "cmd_start"))
                         .clicked()
                     {
-                        if self.cmd_list.is_empty() {
-                            self.status_msg = tr(self.lang, "cmd_empty").to_string();
+                        if !self.loopback_enabled && self.cmd_list.is_empty() {
+                            self.set_status(tr(self.lang, "cmd_empty"));
                         } else if !self.connected {
-                            self.status_msg = tr(self.lang, "cmd_not_connected").to_string();
+                            self.set_status(tr(self.lang, "cmd_not_connected"));
                         } else {
                             self.cmd_loop = true;
                             self.cmd_loop_idx = 0;
@@ -2332,10 +2440,23 @@ impl FrameApp {
                         );
                     }
                 });
+                if self.loopback_enabled {
+                    ui.label(
+                        egui::RichText::new(tr(self.lang, "loopback_setup_tip"))
+                            .color(self.style.text_dim())
+                            .small(),
+                    );
+                }
                 ui.separator();
                 // 命令行列表：编辑 + 逐条发送 + 删除（命令多时可滚动）
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    if self.cmd_list.is_empty() {
+                    if self.loopback_enabled {
+                        ui.label(
+                            egui::RichText::new(tr(self.lang, "loopback_hint"))
+                                .color(self.style.text_dim())
+                                .small(),
+                        );
+                    } else if self.cmd_list.is_empty() {
                         ui.label(egui::RichText::new(tr(self.lang, "cmd_empty")).weak());
                     }
                     for i in 0..self.cmd_list.len() {
@@ -2370,9 +2491,9 @@ impl FrameApp {
             });
         if let Some(i) = del {
             self.cmd_list.remove(i);
-            if self.cmd_list.is_empty() {
+            if !self.loopback_enabled && self.cmd_list.is_empty() {
                 self.cmd_loop = false;
-            } else {
+            } else if !self.cmd_list.is_empty() {
                 self.cmd_loop_idx %= self.cmd_list.len();
             }
         }
@@ -2542,12 +2663,7 @@ impl FrameApp {
                                 self.plot_zoom = 1.4;
                             }
                             if ui.button("🗑").on_hover_text("清空绘图").clicked() {
-                                if let Ok(e) = self.build_engine() {
-                                    self.engine = e;
-                                }
-                                // 快照一并清空：暂停时点清空也应是空图
-                                self.plot_snapshot_vals.clear();
-                                self.plot_snapshot_dif.clear();
+                                self.clear_plot();
                             }
                             // 绘图暂停/继续：暂停时数据照常解析，绘图区冻结在快照上
                             if self.plot_paused {
@@ -3185,6 +3301,86 @@ mod layout_tests {
         app.channels[0].sig_text = "-1".into();
         app.apply_channel_config();
         assert_eq!(app.channel_info_text(), "16位 无符号");
+    }
+
+    /// 回环造帧：帧头拼接 + 00 填充 + 末字节循环码递增。
+    #[test]
+    fn loopback_frame_header_fill_and_increment() {
+        let mut app = FrameApp::new();
+        app.header_text = "EB 90".into();
+        app.length_text = "4".into();
+        app.loopback_code = 0;
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xEB, 0x90, 0x00, 0x00]);
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xEB, 0x90, 0x00, 0x01]);
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xEB, 0x90, 0x00, 0x02]);
+        // 一字节帧头也不特殊：帧长 3 → 头 + 00 填充? 头长1，length3>1+1，resize(2) 补1个00
+        app.header_text = "AB".into();
+        app.length_text = "3".into();
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xAB, 0x00, 0x03]);
+    }
+
+    /// 回环循环码 0→255→0 回绕（u8 wrapping，不 panic）。
+    #[test]
+    fn loopback_code_wraps_ff_to_00() {
+        let mut app = FrameApp::new();
+        app.header_text = "EB 90".into();
+        app.length_text = "4".into();
+        app.loopback_code = 255;
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xEB, 0x90, 0x00, 0xFF]);
+        assert_eq!(app.loopback_code, 0);
+        assert_eq!(app.next_loopback_frame().unwrap(), vec![0xEB, 0x90, 0x00, 0x00]);
+    }
+
+    /// 非法帧长（<= 帧头长度 + 1、非数字）明确报错，不 panic。
+    #[test]
+    fn loopback_bad_length_reports_error() {
+        let mut app = FrameApp::new();
+        app.header_text = "EB 90".into(); // 帧头 2 字节，帧长须 >= 4
+        app.length_text = "3".into();
+        assert!(app.next_loopback_frame().is_err(), "帧长 3 <= 2+1 应报错");
+        app.length_text = "2".into();
+        assert!(app.next_loopback_frame().is_err(), "帧长 2 应报错");
+        app.length_text = "abc".into();
+        assert!(app.next_loopback_frame().is_err(), "非数字帧长应报错");
+        // 帧长正好 = 帧头长度+1（3）仍报错；留够一个填充后才合法。
+        app.length_text = "4".into();
+        assert!(app.next_loopback_frame().is_ok());
+    }
+
+    /// 最近操作：回环运行中固定显示「回环测试中」；一次性回执约 3 秒后消失。
+    #[test]
+    fn status_cell_loopback_running_and_expiry() {
+        let mut app = FrameApp::new();
+        // 回环运行中：固定提示，且不受 status_msg 影响
+        app.loopback_enabled = true;
+        app.cmd_loop = true;
+        app.set_status(tr(app.lang, "cycle_reset_done"));
+        assert_eq!(app.status_cells()[9], tr(app.lang, "loopback_running"));
+        // 停止后：回落到普通回执
+        app.cmd_loop = false;
+        assert_eq!(app.status_cells()[9], tr(app.lang, "cycle_reset_done"));
+        // 回执过期（手动把时间戳拨到 4 秒前）：最近操作格恢复 —
+        app.status_msg_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+        assert_eq!(app.status_cells()[9], "—");
+    }
+
+    /// 🗑 清空绘图：TX 与帧计数一起归 0（防止只清一半），快照也清空。
+    #[test]
+    fn clear_plot_resets_tx_and_frame_count() {
+        let mut app = FrameApp::new();
+        app.tx_count = 42;
+        app.engine.frame_count = 7;
+        app.engine.checksum_errors = 3;
+        app.plot_snapshot_vals.push(vec![1, 2, 3]);
+        app.plot_snapshot_dif.push(vec![4, 5, 6]);
+        app.clear_plot();
+        assert_eq!(app.tx_count, 0, "清空绘图应把 TX 计数归零");
+        assert_eq!(app.engine.frame_count, 0, "清空绘图应把帧计数归零");
+        assert_eq!(app.engine.checksum_errors, 0, "清空绘图应把校验错归零");
+        assert!(
+            app.plot_snapshot_vals.is_empty() && app.plot_snapshot_dif.is_empty(),
+            "清空绘图应清掉暂停快照"
+        );
     }
 
 }
