@@ -16,7 +16,11 @@ use crate::link::{
 use crate::ui::i18n::{Lang, tr};
 use crate::ui::style::StyleConfig;
 use eframe::egui;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// 波特率预置档：常用档（≤1000000）+ 1000000 + 5000000（用户要求精简）
@@ -29,6 +33,55 @@ const BAUD_PRESETS: &[&str] = &[
 const CARD_PAD: f32 = 6.0;
 /// 中央三张卡片（绘图 / Data 发送行 / 状态行）的统一间隙。
 const CARD_GAP_V: f32 = 8.0;
+/// 验算结果标题字号：「发现 N 处异常」与「未发现丢帧」共用，保证醒目程度一致。
+const VERIFY_HEADING_SIZE: f32 = 14.0;
+/// 左栏三个离线按钮字号（中英文均需放得下，宽度回归测试会逐一校验）。
+const OFFLINE_BTN_FONT_SIZE: f32 = 11.0;
+/// 验算绘图区最小边长（正方形）：截图「异常帧：第 3943 帧（图中红线）」红字约 287px，
+/// 两个文字长度约 574px，取 580 留余量。窗口 min_size 保证宽度同样不小于它。
+const VERIFY_PLOT_MIN_SIZE: f32 = 580.0;
+/// 右栏顶部「曲线说明 + 红字异常帧号」一行文字及分隔的预留高度。
+/// 两行并一行后由 48 降为 28，让图往上贴；绘图高度仍由整窗高度减去它得到，
+/// 弹窗上下拖动时图高严格跟随，且图一直填到右栏底部。
+const VERIFY_TOP_OVERHEAD: f32 = 28.0;
+/// 验算弹窗分隔线默认位置：等于可拖动下限 VERIFY_SPLIT_MIN（用户实测：拖到最小时
+/// 分隔线紧贴清单，才是对的对齐效果，故默认即该值）。打开后仍可左右拖动并持久化；
+/// 主界面 style.left_panel_width 是独立常量，不受影响。
+const VERIFY_SPLIT_DEFAULT: f32 = 160.0;
+/// 验算弹窗最小/默认尺寸。min 由「左栏 300 + 分隔 6 + 绘图 580 + 内边距 34 = 920」，
+/// 以及「顶部 48 + 绘图 580 + 标题栏/内边距 32 = 660」推出；default 必须 >= min。
+const VERIFY_WINDOW_MIN_W: f32 = 920.0;
+const VERIFY_WINDOW_MIN_H: f32 = 660.0;
+const VERIFY_WINDOW_DEFAULT_W: f32 = 960.0;
+const VERIFY_WINDOW_DEFAULT_H: f32 = 720.0;
+/// 验算弹窗透明度百分比范围：100=完全不透明（与加 fill 前观感一致），20=最透
+/// （再低整窗几乎消失，会被误认为坏了）；默认 80 一打开就是轻微透。
+const VERIFY_OPACITY_MIN: u8 = 20;
+const VERIFY_OPACITY_MAX: u8 = 100;
+const VERIFY_OPACITY_DEFAULT: u8 = 80;
+/// 验算弹窗可拖动分隔线：左栏最小 160，右栏绘图区最小 260；默认左栏也取最小值 160
+/// （用户实测：拖到最小时分隔线紧贴清单才是对的对齐效果，故默认即该值）。
+const VERIFY_SPLIT_MIN: f32 = 160.0;
+const VERIFY_SPLIT_RIGHT_MIN: f32 = 260.0;
+/// 验算快照抓取上限：前后各最多 500 帧（用户可在弹窗内调小到 1）。
+/// 环形缓冲按 2*MAX+1 帧保留，快照内存上限 200 条 × 1001 帧 × 通道数。
+const VERIFY_SNAP_MAX: usize = 500;
+/// 状态栏空闲轮播：每 3 秒换一条，按 elapsed/3 取模循环；最近操作格宽度上限 260（超长截断+悬停全文）。
+const STATUS_TIP_SECS: u64 = 3;
+const RECENT_MAX_W: f32 = 260.0;
+/// 轮播词条 key，顺序即轮播顺序（16 条，中英各一套在 i18n）。
+const STATUS_TIP_KEYS: &[&str] = &[
+    "tip_wheel_pan", "tip_wheel_zoom", "tip_reset_view", "tip_paused", "tip_clear",
+    "tip_log_append", "tip_no_header", "tip_hex_source", "tip_no_cycle", "tip_verify_config",
+    "tip_config_save", "tip_theme", "tip_samples", "tip_sign", "tip_loopback", "tip_verify",
+];
+/// 纯函数：经过秒数 → 轮播下标。测试可直接喂时间验证切换与回绕。
+fn status_tip_index(elapsed_secs: u64, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    ((elapsed_secs / STATUS_TIP_SECS) as usize) % n
+}
 
 // ============ 配置持久化（.config.json，字段对齐 Python 版） ============
 
@@ -97,6 +150,13 @@ struct PersistConfig {
     cmd_list: Vec<String>,
     #[serde(default)]
     cmd_interval_ms: u32,
+    #[serde(default = "default_verify_split_w")]
+    verify_split_w: f32,
+}
+
+/// 老配置缺 verify_split_w 时回退到 160（与拖动下限一致）。
+fn default_verify_split_w() -> f32 {
+    VERIFY_SPLIT_DEFAULT
 }
 
 /// 单通道编辑状态（输入框原样保存，应用时才解析 —— 与 Python 版一致）。
@@ -168,6 +228,287 @@ pub enum ConfigReceipt {
     FrameApplied,
     ChannelApplied(usize),
     Error(String),
+}
+
+/// 数据验算：一条循环码异常记录。
+/// `snapshot` = 异常点前后各最多 VERIFY_SNAP_MAX 帧的通道值（按通道分组，每列最多 1001 点）；
+/// UI 按「前/后 N 帧」截取显示；超过 200 条时只记清单不存快照（避免内存爆炸）。
+#[derive(Clone, Debug)]
+pub struct VerifyAnomaly {
+    pub frame_no: u64,
+    pub expected: u64,
+    pub actual: u64,
+    pub lost: u64,
+    pub snapshot: Option<Vec<Vec<i64>>>,
+    /// 异常点在 snapshot 各列中的下标（用来把它移到图中心 x=0）。
+    /// 数据流开头/结尾快照不足 101 帧时该值 <50 或 >50，仍保证居中。
+    pub snap_center: usize,
+}
+
+/// 数据验算弹窗状态（None = 无弹窗）。
+#[derive(Clone, Debug)]
+pub struct VerifyState {
+    pub running: bool,
+    pub read: u64,
+    pub total: u64,
+    pub anomalies: Vec<VerifyAnomaly>,
+    pub selected: Option<usize>,
+    /// 配置错误 / 读取失败提示（非空时优先显示）。
+    pub msg: String,
+    /// 弹窗内「前 N 帧 / 后 N 帧」输入（字符串便于编辑，取值时 clamp 到 1..=500）。
+    pub before_text: String,
+    pub after_text: String,
+    /// 数据含非法/不完整字符：为真时不得显示「未发现丢帧」，改显示非法字符提示。
+    pub has_invalid_char: bool,
+    /// 下一帧强制把快照图坐标重置到数据真实范围。随弹窗状态一起存取，
+    /// 避免放在 FrameApp 上被其它地方提前消费/丢失（换条目、改帧数、验算完成置位）。
+    pub reset_bounds: bool,
+    /// 弹窗底板透明度百分比 20..=100（100 不透明，默认 80）。滑块拖动即时生效。
+    pub opacity_pct: u8,
+}
+
+/// 验算后台线程 → UI 的消息。
+pub enum VerifyMsg {
+    Progress { read: u64, total: u64 },
+    Done { anomalies: Vec<VerifyAnomaly>, has_invalid_char: bool },
+    Error(String),
+}
+
+/// 验算核心：流式喂 hex 文本字节 → 分帧 → 调用 Engine::process_buffer
+/// （内部即 cycle_process_frame，保证与实时判定完全一致）→ 记录异常与前后快照。
+/// 内存恒定：只保留最近 2*VERIFY_SNAP_MAX+1 帧的通道值环形缓冲，不保留全量帧/通道数据。
+/// 快照按最大窗口抓取，UI 再按用户设置的「前/后 N 帧」截取，无需重跑验算。
+pub struct VerifyRunner {
+    /// 验算专用引擎（独立副本，不碰主绘图区）。
+    engine: Engine,
+    /// 未成帧的字节缓冲。
+    byte_buf: Vec<u8>,
+    /// 跨块边界的半个十六进制字符。
+    hex_carry: Option<char>,
+    /// UTF-8 BOM（EF BB BF）在文件开头的匹配进度（0/1/2 = 匹配中，3 = 已结束）。
+    bom_state: u8,
+    /// 发现非 hex、非空白（空格/制表/换行/回车/BOM）字符，或末尾出现落单的半字节。
+    /// 为真时结果不可信，UI 不得显示「未发现丢帧」。
+    pub has_invalid_char: bool,
+    /// 最近 2*VERIFY_SNAP_MAX+1 帧：(帧号, 各通道值)。
+    ring: VecDeque<(u64, Vec<i64>)>,
+    /// 异常清单。
+    pub anomalies: Vec<VerifyAnomaly>,
+    /// 待补「后 MAX 帧」快照的异常下标。
+    pending_snap: Vec<usize>,
+    /// 最多存多少条快照。
+    max_snapshots: usize,
+}
+
+impl VerifyRunner {
+    pub fn new(mut engine: Engine, max_snapshots: usize) -> Self {
+        // 验算路径不做通道全量提取/CSV 保存，关掉避免大文件内存增长。
+        engine.extracted_save_enabled = false;
+        // 无帧头时本 helper 已按帧长从字节 0 定长切帧（视为起点对齐），
+        // 直接锁定同步，避免 process_buffer 为「连续两帧校验」再等下一帧。
+        if engine.frame_header.is_empty() {
+            engine.sync_locked = true;
+        }
+        Self {
+            engine,
+            byte_buf: Vec::new(),
+            hex_carry: None,
+            bom_state: 0,
+            has_invalid_char: false,
+            ring: VecDeque::with_capacity(2 * VERIFY_SNAP_MAX + 1),
+            anomalies: Vec::new(),
+            pending_snap: Vec::new(),
+            max_snapshots,
+        }
+    }
+
+    /// 从环形缓冲里取 [frame-MAX, frame+MAX] 的通道值，转置成「按通道分组」。
+    /// 按最大窗口抓取，UI 再按用户设置的「前/后 N 帧」截取；异常帧下标一并返回。
+    fn snapshot_at(&self, frame: u64) -> Option<(Vec<Vec<i64>>, usize)> {
+        let lo = frame.saturating_sub(VERIFY_SNAP_MAX as u64);
+        let hi = frame.saturating_add(VERIFY_SNAP_MAX as u64);
+        let frames: Vec<&(u64, Vec<i64>)> = self
+            .ring
+            .iter()
+            .filter(|(f, _)| *f >= lo && *f <= hi)
+            .collect();
+        if frames.is_empty() {
+            return None;
+        }
+        // 异常帧若已不在环形缓冲里（极端截断），退化为取中点，仍不会 panic。
+        let center = frames
+            .iter()
+            .position(|(f, _)| *f == frame)
+            .unwrap_or_else(|| frames.len() / 2);
+        let n = frames[0].1.len();
+        let mut out = vec![Vec::with_capacity(frames.len()); n];
+        for (_, v) in frames {
+            for (i, &x) in v.iter().enumerate() {
+                if i < n {
+                    out[i].push(x);
+                }
+            }
+        }
+        Some((out, center))
+    }
+
+    /// 完成补快照：对已经等到「后 MAX 帧」的异常填 snapshot。
+    fn finalize_snapshots(&mut self, current_frame: u64, force: bool) {
+        let mut done = Vec::new();
+        for (k, &idx) in self.pending_snap.iter().enumerate() {
+            let f = self.anomalies[idx].frame_no;
+            if force || current_frame >= f.saturating_add(VERIFY_SNAP_MAX as u64) {
+                if let Some((snap, center)) = self.snapshot_at(f) {
+                    self.anomalies[idx].snapshot = Some(snap);
+                    self.anomalies[idx].snap_center = center;
+                }
+                done.push(k);
+            }
+        }
+        for k in done.into_iter().rev() {
+            self.pending_snap.remove(k);
+        }
+    }
+
+    /// 喂入一块原始文本字节（可能把两字符的十六进制字节拆开，靠 hex_carry 衔接）。
+    /// 只把 ASCII 空白与文件开头 BOM 当合法分隔；其余非 hex 字节一律记为非法，
+    /// 不再静默跳过（否则乱码里的合法 hex 会被拼成帧，得出误导性的「未发现丢帧」）。
+    pub fn feed(&mut self, chunk: &[u8]) {
+        // 1) 十六进制字符流：跨块凑成对；遇非法字符清掉未配对的半字节，避免跨非法字符拼字节。
+        const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+        for &b in chunk {
+            // 文件开头允许一个 UTF-8 BOM，按字节匹配（跨块安全）；中途出现的 BOM 视为非法。
+            if self.bom_state < 3 {
+                if b == BOM[self.bom_state as usize] {
+                    self.bom_state += 1;
+                    continue;
+                }
+                if self.bom_state > 0 {
+                    // 之前的部分匹配不是 BOM：那几个字节本身非 hex，记为非法。
+                    self.has_invalid_char = true;
+                }
+                self.bom_state = 3;
+            }
+            if b.is_ascii_hexdigit() {
+                let c = b as char;
+                if let Some(first) = self.hex_carry.take() {
+                    let s = format!("{}{}", first, c);
+                    if let Ok(v) = u8::from_str_radix(&s, 16) {
+                        self.byte_buf.push(v);
+                    }
+                } else {
+                    self.hex_carry = Some(c);
+                }
+            } else if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+                // 合法分隔符，保持 hex_carry（与原行为一致）。
+            } else {
+                // 乱码：如 fadfdsa / sa / "0x" 前缀的 x（现有格式是纯 hex 空格分隔）。
+                self.has_invalid_char = true;
+                self.hex_carry = None;
+            }
+        }
+        // 2) 分帧：逐帧喂给独立引擎的 process_buffer（内部必调 cycle_process_frame）。
+        let header = self.engine.frame_header.clone();
+        let frame_len = self.engine.frame_length.max(1);
+        loop {
+            let found = if header.is_empty() {
+                Some(0)
+            } else {
+                self.byte_buf
+                    .windows(header.len())
+                    .position(|w| w == header.as_slice())
+            };
+            match found {
+                None => {
+                    // 与原版一致：无帧头时保留末尾 header_len-1 字节等待下一块。
+                    if header.len() > 1 && self.byte_buf.len() > header.len() - 1 {
+                        let keep = header.len() - 1;
+                        let len = self.byte_buf.len();
+                        self.byte_buf.drain(..len - keep);
+                    } else if header.len() == 1 {
+                        self.byte_buf.clear();
+                    }
+                    break;
+                }
+                Some(idx) => {
+                    if idx > 0 {
+                        self.byte_buf.drain(..idx);
+                    }
+                }
+            }
+            if self.byte_buf.len() < frame_len {
+                break;
+            }
+            let frame: Vec<u8> = self.byte_buf[..frame_len].to_vec();
+            self.byte_buf.drain(..frame_len);
+
+            let jumps_before = self.engine.cycle_jumps;
+            let lost_before = self.engine.cycle_lost;
+            let lens_before: Vec<usize> = self.engine.channel_values.iter().map(|v| v.len()).collect();
+            self.engine.rx_buffer.clear();
+            self.engine.rx_buffer.extend_from_slice(&frame);
+            self.engine.process_buffer();
+            // 缓冲区不随文件增长。
+            self.engine.frame_log.clear();
+
+            let frame_no = self.engine.frame_count;
+            let mut vals = Vec::with_capacity(lens_before.len());
+            for (i, before) in lens_before.iter().enumerate() {
+                let last = self
+                    .engine
+                    .channel_values
+                    .get(i)
+                    .and_then(|v| v.get(*before..))
+                    .and_then(|s| s.last())
+                    .copied()
+                    .unwrap_or(0);
+                vals.push(last);
+                if let Some(v) = self.engine.channel_values.get_mut(i) {
+                    v.clear();
+                }
+            }
+            self.ring.push_back((frame_no, vals));
+            while self.ring.len() > 2 * VERIFY_SNAP_MAX + 1 {
+                self.ring.pop_front();
+            }
+            self.finalize_snapshots(frame_no, false);
+
+            if self.engine.cycle_jumps > jumps_before {
+                let (expected, actual) = self.engine.cycle_last_jump.unwrap_or((0, 0));
+                let store = self.anomalies.len() < self.max_snapshots;
+                let idx = self.anomalies.len();
+                self.anomalies.push(VerifyAnomaly {
+                    frame_no,
+                    expected,
+                    actual,
+                    lost: self.engine.cycle_lost.saturating_sub(lost_before),
+                    snapshot: None,
+                    snap_center: 0,
+                });
+                if store {
+                    self.pending_snap.push(idx);
+                }
+            }
+        }
+    }
+
+    /// 收尾：把还没等到后 MAX 帧的异常快照用现有环形缓冲补齐。
+    /// 同时返回「数据是否含非法/不完整字符」供 UI 选择结论文案。
+    pub fn finish_with_status(mut self) -> (Vec<VerifyAnomaly>, bool) {
+        if self.hex_carry.is_some() {
+            // 末尾落单的半字节（如单独一个 'f'）不是完整字节，数据不完整。
+            self.has_invalid_char = true;
+        }
+        let invalid = self.has_invalid_char;
+        let f = self.engine.frame_count;
+        self.finalize_snapshots(f, true);
+        (self.anomalies, invalid)
+    }
+
+    /// 仅取异常清单（测试与简单调用方用）。
+    pub fn finish(self) -> Vec<VerifyAnomaly> {
+        self.finish_with_status().0
+    }
 }
 
 pub struct FrameApp {
@@ -256,6 +597,8 @@ pub struct FrameApp {
     pub status_msg: String,
     /// status_msg 的设置时刻：一次性提示约 3 秒后自动消失。
     pub status_msg_at: Option<Instant>,
+    /// 空闲轮播提示的起算时刻：无回执/非回环时每 3 秒换一条快捷提示。
+    pub status_tip_epoch: Instant,
     /// 连接格：非空时取代常驻「已连接/未连接」（串口错误、掉线原因）；状态变化时清空。
     pub link_msg: String,
     /// 帧配置格：应用成功或配置错误，一直留到下次应用（存状态，显示时翻译）。
@@ -277,6 +620,15 @@ pub struct FrameApp {
     pub plot_snapshot_base: u64,
     /// 后台文件对话框结果接收端（避免阻塞 UI 线程导致"无响应"）
     pub pick: Option<(PickKind, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
+    /// 数据验算弹窗状态（None = 无弹窗）
+    pub verify: Option<VerifyState>,
+    /// 验算后台线程消息接收端
+    pub verify_rx: Option<Receiver<VerifyMsg>>,
+    /// 验算弹窗内快照图的缩放/复位计数（与主绘图区独立）
+    pub verify_zoom: f32,
+    pub verify_epoch: u64,
+    /// 验算弹窗可拖动分隔线位置（左栏宽度），持久化到配置，默认 240。
+    pub verify_split_w: f32,
     /// 上次同步到窗口标题栏的颜色（变化才调 DWM，避免每帧系统调用）
     pub last_titlebar: Option<egui::Color32>,
 }
@@ -286,6 +638,8 @@ pub struct FrameApp {
 pub enum PickKind {
     Csv,
     Txt,
+    /// 数据验算：选原始数据 txt（打开对话框，不是保存）。
+    Verify,
 }
 
 impl FrameApp {
@@ -406,6 +760,7 @@ impl FrameApp {
             loopback_code: 0,
             status_msg: String::new(),
             status_msg_at: None,
+            status_tip_epoch: Instant::now(),
             link_msg: String::new(),
             frame_msg: ConfigReceipt::None,
             channel_msg: ConfigReceipt::None,
@@ -417,12 +772,17 @@ impl FrameApp {
             plot_snapshot_dif: Vec::new(),
             plot_snapshot_base: 0,
             pick: None,
+            verify: None,
+            verify_rx: None,
+            verify_zoom: 1.0,
+            verify_epoch: 0,
+            verify_split_w: VERIFY_SPLIT_DEFAULT,
             last_titlebar: None,
         };
         // 上次运行的 .config.json（语言/主题/帧配置/通道配置/连接参数/命令列表）
         app.load_config();
         // 启动时即按配置装配引擎（连接后直接收数）。
-        // 走「静默」那条路：开机不该冒充用户点过「应用」而显示「帧配置已应用」。
+        // 走「静默」那条路：开机不该冒充用户点过「应用」而显示「帧格式已配置」。
         // 配置本身有错时仍会显示明确错误提示，这个保留。
         app.apply_frame_config_silent();
         app.save_config(); // 保留原有的启动时写回（旧配置迁移结果落盘），只是不留回执
@@ -552,7 +912,7 @@ impl FrameApp {
     // ============ 配置应用 ============
 
     /// 应用帧配置：解析输入框 → 重建引擎（清空历史数据，同 Python 应用语义）。
-    /// 只有引擎真的重建成功才显示「帧配置已应用」，否则保留 build_engine 给出的
+    /// 只有引擎真的重建成功才显示「帧格式已配置」，否则保留 build_engine 给出的
     /// 明确错误提示（循环码位置越界 / 解析失败不能静默）。
     pub fn apply_frame_config(&mut self) {
         let ok = self.apply_frame_config_silent();
@@ -769,7 +1129,12 @@ impl FrameApp {
     // ============ 离线分析 ============
 
     /// 载入文件 / 分析剪贴板 共用：解析 hex → 按当前帧配置喂引擎绘图。
+    /// CSV 不是原始数据（里面没有循环码），识别到就给友好提示，绝不走 hex 解析报错。
     fn analyze_hex_string(&mut self, hex_str: &str) {
+        if is_csv_text(hex_str) {
+            self.set_status(tr(self.lang, "offline_csv_unsupported"));
+            return;
+        }
         // 配置错误（如循环码位置越界）时保留 frame_msg 里的明确提示，不静默用旧引擎继续
         if !self.apply_frame_config_silent() {
             return;
@@ -777,33 +1142,44 @@ impl FrameApp {
         match parse_header_hex(hex_str) {
             Ok(data) => {
                 if data.is_empty() {
-                    self.set_status("离线分析: 数据为空");
+                    self.set_status(tr(self.lang, "offline_empty"));
                     return;
                 }
                 self.engine.rx_buffer.extend_from_slice(&data);
                 self.engine.process_buffer();
                 self.trim_buffers();
                 self.view_plot = true;
-                self.set_status(format!(
-                    "离线分析完成: 帧 {} 样本 {}",
-                    self.engine.frame_count, self.engine.sample_count
+                self.set_status(fmt_nums(
+                    tr(self.lang, "offline_done"),
+                    &[self.engine.frame_count, self.engine.sample_count],
                 ));
             }
-            Err(e) => {
-                self.set_status(format!("解析错误: {}", e));
+            Err(_) => {
+                // 只给固定短句，不把非法原文/底层细节塞进状态栏（曾撑爆 TX）。
+                self.set_status(tr(self.lang, "offline_parse_err"));
             }
         }
     }
 
     fn load_file_offline(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Text/Hex", &["txt", "hex", "csv", "log"])
+            .add_filter("Text/Hex", OFFLINE_TEXT_EXTS)
             .add_filter("All files", &["*"])
             .pick_file()
         {
+            // 仍有 All files 入口：按扩展名再挡一次 CSV。
+            let csv_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("csv"))
+                .unwrap_or(false);
+            if csv_ext {
+                self.set_status(tr(self.lang, "offline_csv_unsupported"));
+                return;
+            }
             match std::fs::read_to_string(&path) {
                 Ok(content) => self.analyze_hex_string(&content),
-                Err(e) => self.set_status(format!("读取失败: {}", e)),
+                Err(e) => self.set_status(fmt_str(tr(self.lang, "offline_read_err"), &e.to_string())),
             }
         }
     }
@@ -812,12 +1188,445 @@ impl FrameApp {
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => {
                 if text.trim().is_empty() {
-                    self.set_status("剪贴板为空");
+                    self.set_status(tr(self.lang, "clipboard_empty"));
                 } else {
                     self.analyze_hex_string(&text);
                 }
             }
-            Err(_) => self.set_status("剪贴板不可用或为空"),
+            Err(_) => self.set_status(tr(self.lang, "clipboard_unavailable")),
+        }
+    }
+
+    // ============ 数据验算（原始数据 txt → 循环码丢帧定位） ============
+
+    /// 起验算：用当前帧配置构造独立引擎，后台 BufReader 流式读（1MB 块），
+    /// UI 只收进度消息，弹窗一直开着显示进度，不会像卡死。
+    fn start_verify(&mut self, path: PathBuf) {
+        // 没填循环码位置时引擎根本不判定，必须明确拒绝，不能显示「未发现丢帧」误导用户。
+        if self.cycle_pos_text.trim().is_empty() {
+            self.verify_rx = None;
+            self.verify = Some(VerifyState {
+                running: false,
+                read: 0,
+                total: 0,
+                anomalies: Vec::new(),
+                selected: None,
+                msg: tr(self.lang, "verify_no_cycle").to_string(),
+                before_text: "50".into(),
+                after_text: "50".into(),
+                has_invalid_char: false,
+                reset_bounds: true,
+                opacity_pct: VERIFY_OPACITY_DEFAULT,
+            });
+            self.verify_zoom = 1.0;
+            self.verify_epoch = self.verify_epoch.wrapping_add(1);
+            return;
+        }
+        let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let engine = match self.build_engine() {
+            Ok(e) => e,
+            Err(s) => {
+                self.verify = Some(VerifyState {
+                    running: false,
+                    read: 0,
+                    total,
+                    anomalies: Vec::new(),
+                    selected: None,
+                    msg: format!("{}: {}", tr(self.lang, "config_error"), s),
+                    before_text: "50".into(),
+                    after_text: "50".into(),
+                    has_invalid_char: false,
+                    reset_bounds: true,
+                    opacity_pct: VERIFY_OPACITY_DEFAULT,
+                });
+                return;
+            }
+        };
+        self.verify = Some(VerifyState {
+            running: true,
+            read: 0,
+            total,
+            anomalies: Vec::new(),
+            selected: None,
+            msg: String::new(),
+            before_text: "50".into(),
+            after_text: "50".into(),
+            has_invalid_char: false,
+            reset_bounds: true,
+            opacity_pct: VERIFY_OPACITY_DEFAULT,
+        });
+        self.verify_zoom = 1.0;
+        self.verify_epoch = self.verify_epoch.wrapping_add(1);
+        let (tx, rx) = mpsc::channel();
+        self.verify_rx = Some(rx);
+        std::thread::spawn(move || {
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(VerifyMsg::Error(e.to_string()));
+                    return;
+                }
+            };
+            let mut reader = BufReader::with_capacity(1 << 20, file);
+            let mut runner = VerifyRunner::new(engine, 200);
+            let mut buf = [0u8; 1 << 20];
+            let mut read = 0u64;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        read += n as u64;
+                        runner.feed(&buf[..n]);
+                        let _ = tx.send(VerifyMsg::Progress { read, total });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(VerifyMsg::Error(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            let (anomalies, has_invalid_char) = runner.finish_with_status();
+            let _ = tx.send(VerifyMsg::Done {
+                anomalies,
+                has_invalid_char,
+            });
+        });
+    }
+
+    /// 每帧收割验算进度 / 结果消息。
+    fn poll_verify(&mut self) {
+        if self.verify_rx.is_none() {
+            return;
+        }
+        let mut msgs = Vec::new();
+        if let Some(rx) = &self.verify_rx {
+            let mut got_terminal = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => {
+                        if matches!(m, VerifyMsg::Done { .. } | VerifyMsg::Error(_)) {
+                            got_terminal = true;
+                        }
+                        msgs.push(m);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !got_terminal {
+                            msgs.push(VerifyMsg::Done {
+                                anomalies: Vec::new(),
+                                has_invalid_char: false,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if msgs.is_empty() {
+            return;
+        }
+        let mut close_rx = false;
+        if let Some(st) = self.verify.as_mut() {
+            for m in msgs {
+                match m {
+                    VerifyMsg::Progress { read, total } => {
+                        st.read = read;
+                        st.total = total;
+                    }
+                    VerifyMsg::Done { anomalies, has_invalid_char } => {
+                        st.anomalies = anomalies;
+                        st.has_invalid_char = has_invalid_char;
+                        st.running = false;
+                        // 验算完成 = 重置事件，标志随 state 一起保存，不再放在 FrameApp 上。
+                        st.reset_bounds |= verify_reset_on_event(false, false, true);
+                        close_rx = true;
+                    }
+                    VerifyMsg::Error(e) => {
+                        st.msg = e;
+                        st.running = false;
+                        close_rx = true;
+                    }
+                }
+            }
+        }
+        if close_rx {
+            self.verify_rx = None;
+        }
+    }
+
+    /// 验算弹窗：进行中显示进度 / msg 横跨整窗；完成后左栏异常清单（独立滚动）+ 右栏详情与快照图。
+    fn verify_window(&mut self, ctx: &egui::Context) {
+        if self.verify.is_none() {
+            return;
+        }
+        let mut state = self.verify.take().unwrap();
+        let mut open = true;
+        // 底板颜色跟随当前主题（取 visuals.window_fill 的 rgb），只把 alpha 换成滑块值。
+        // egui 0.29 的 Window 没有 .fill()，要用 .frame(Frame::window(...).fill(...))；
+        // 100% 时 alpha=255、rgb 与默认 Frame::window 相同，观感与未设置前完全一致。
+        let style = ctx.style();
+        let win_fill = style.visuals.window_fill();
+        let verify_fill = egui::Color32::from_rgba_unmultiplied(
+            win_fill.r(),
+            win_fill.g(),
+            win_fill.b(),
+            verify_opacity_alpha(state.opacity_pct),
+        );
+        egui::Window::new(tr(self.lang, "verify_title"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .min_size([VERIFY_WINDOW_MIN_W, VERIFY_WINDOW_MIN_H])
+            .default_size([VERIFY_WINDOW_DEFAULT_W, VERIFY_WINDOW_DEFAULT_H])
+            .frame(egui::Frame::window(&style).fill(verify_fill))
+            .show(ctx, |ui| {
+                // 在整窗 Ui 上取一次内容高度：嵌套 Ui 的 available_height 在 vertical /
+                // horizontal 中可能是受限值，绘图高度必须直接跟整窗尺寸走。
+                let window_h = ui.available_height();
+                if state.running {
+                    ui.label(
+                        egui::RichText::new(tr(self.lang, "verify_waiting"))
+                            .color(self.style.accent_color()),
+                    );
+                    let frac = if state.total > 0 {
+                        (state.read as f32 / state.total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!("{} / {}", state.read, state.total)),
+                    );
+                } else if !state.msg.is_empty() {
+                    ui.label(egui::RichText::new(&state.msg).color(self.style.text_dim()));
+                } else if state.anomalies.is_empty() {
+                    // 非法字符优先于「未发现丢帧」：烂数据绝不能被说成正常。
+                    let (hint, warning) = verify_result_hint(self.lang, state.has_invalid_char, 0)
+                        .expect("无异常时必有结论提示");
+                    let color = if warning {
+                        egui::Color32::from_rgb(0xE0, 0x40, 0x40)
+                    } else {
+                        egui::Color32::from_rgb(0x2E, 0xA0, 0x55)
+                    };
+                    ui.label(
+                        egui::RichText::new(hint)
+                            .strong()
+                            .size(VERIFY_HEADING_SIZE)
+                            .color(color),
+                    );
+                    if warning {
+                        ui.label(
+                            egui::RichText::new(tr(self.lang, "verify_invalid_data_note"))
+                                .color(self.style.text_dim()),
+                        );
+                    }
+                } else {
+                    // 左右分栏直接从弹窗内容区顶部开始：右栏第一行就是详情文字，顶部不放
+                    // 整窗横条元素（结论标题、前后帧输入横条都移入左栏），否则它们内容靠左、
+                    // 在右栏正上方留下整行空白，看起来像「右栏顶部一大块空白」。
+                    // 常规 1/3 : 2/3；窄窗口优先保右栏 >= 260px。
+                    ui.horizontal(|ui| {
+                        let total_w = ui.available_width();
+                        let list_w = verify_split_width(total_w, self.verify_split_w);
+                        // 用整窗高度 window_h 定高，不能用 ui.available_height()：
+                        // 后者在 horizontal 内会收缩到内容高度，导致红框只包住几条就停。
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(list_w, window_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // 结论标题 + 透明度滑块同一行：用户要求滑块紧跟「发现 N 处异常：」。
+                                // 两个分支（正常 / 数据含非法字符）都要带滑块。
+                                if state.has_invalid_char {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(tr(self.lang, "verify_invalid_data"))
+                                                .strong()
+                                                .size(VERIFY_HEADING_SIZE)
+                                                .color(egui::Color32::from_rgb(0xE0, 0x40, 0x40)),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut state.opacity_pct,
+                                                VERIFY_OPACITY_MIN..=VERIFY_OPACITY_MAX,
+                                            )
+                                            .show_value(false),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(tr(self.lang, "verify_invalid_data_note"))
+                                            .color(self.style.text_dim()),
+                                    );
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(fmt_nums(
+                                                tr(self.lang, "verify_found"),
+                                                &[state.anomalies.len() as u64],
+                                            ))
+                                            .strong()
+                                            .size(VERIFY_HEADING_SIZE),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut state.opacity_pct,
+                                                VERIFY_OPACITY_MIN..=VERIFY_OPACITY_MAX,
+                                            )
+                                            .show_value(false),
+                                        );
+                                    });
+                                }
+                                // 前后帧输入：两个短输入框，回到加滑块前的原始写法。
+                                let before_prev = state.before_text.clone();
+                                let after_prev = state.after_text.clone();
+                                ui.horizontal(|ui| {
+                                    ui.label(tr(self.lang, "verify_before"));
+                                    ui.add(egui::TextEdit::singleline(&mut state.before_text).desired_width(44.0));
+                                    ui.label(tr(self.lang, "verify_after"));
+                                    ui.add(egui::TextEdit::singleline(&mut state.after_text).desired_width(44.0));
+                                });
+                                // 前后帧数输入变化：下一帧强制重置到新窗口的真实边界。
+                                if state.before_text != before_prev || state.after_text != after_prev {
+                                    self.verify_epoch = self.verify_epoch.wrapping_add(1);
+                                    self.verify_zoom = 1.0;
+                                    state.reset_bounds |= verify_reset_on_event(false, true, false);
+                                }
+                                // 异常清单固定框：从清单标题下沿延伸到底部，条目少也保留整块
+                                // 区域，条目多只在框内滚动。描边用软件统一配色，不用红色。
+                                // 关键：左栏已用 window_h 定高，ui.available_height() 就是精确剩余；
+                                // ScrollArea auto_shrink(false) 会吃掉它。切勿再 set_min_height——
+                                // 那会让内容最小高度 > 窗口，拖动缩放松手后被 egui 顶回、框溢出底部。
+                                let frame_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                                egui::Frame::none()
+                                    .stroke(frame_stroke)
+                                    .rounding(3.0)
+                                    .inner_margin(egui::Margin::same(4.0))
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for (i, a) in state.anomalies.iter().enumerate() {
+                                                    let line = fmt_nums(
+                                                        tr(self.lang, "verify_anomaly_line"),
+                                                        &[a.frame_no, a.expected, a.actual, a.lost],
+                                                    );
+                                                    if ui.selectable_label(state.selected == Some(i), line).clicked() {
+                                                        state.selected = Some(i);
+                                                        self.verify_epoch = self.verify_epoch.wrapping_add(1);
+                                                        self.verify_zoom = 1.0;
+                                                        // 换异常条目：下一帧强制重置到该条快照的真实边界。
+                                                        state.reset_bounds |= verify_reset_on_event(true, false, false);
+                                                    }
+                                                }
+                                            });
+                                    });
+                            },
+                        );
+                        // 可拖动分隔条：紧贴左栏内容，hover 高亮，拖动改 verify_split_w，
+                        // 松手时 save_config 持久化（不每帧写文件）。
+                        let sep_w = 6.0_f32;
+                        let (sep_rect, sep_resp) = ui.allocate_exact_size(
+                            egui::vec2(sep_w, ui.available_height()),
+                            egui::Sense::drag(),
+                        );
+                        let sep_color = if sep_resp.hovered() || sep_resp.dragged() {
+                            self.style.accent_color()
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_stroke.color
+                        };
+                        ui.painter().line_segment(
+                            [sep_rect.center_top(), sep_rect.center_bottom()],
+                            egui::Stroke::new(2.0_f32, sep_color),
+                        );
+                        if sep_resp.dragged() {
+                            self.verify_split_w = verify_split_width(
+                                total_w,
+                                self.verify_split_w + sep_resp.drag_delta().x,
+                            );
+                        }
+                        if sep_resp.drag_stopped() {
+                            self.save_config();
+                        }
+                        ui.vertical(|right| {
+                            let before = verify_frames_from_text(&state.before_text);
+                            let after = verify_frames_from_text(&state.after_text);
+                            if let Some(sel) = state.selected {
+                                if let Some(a) = state.anomalies.get(sel) {
+                                    // 说明文字与红字异常帧号并排一行，靠 egui 默认 item_spacing 分隔。
+                                    right.horizontal(|ui| {
+                                        ui.label(tr(self.lang, "verify_detail"));
+                                        // 明确写出异常帧真实帧号，避免相对坐标让人认不出是哪一帧。
+                                        ui.label(
+                                            egui::RichText::new(fmt_nums(
+                                                tr(self.lang, "verify_center_frame"),
+                                                &[a.frame_no],
+                                            ))
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(0xE0, 0x40, 0x40)),
+                                        );
+                                    });
+                                    if let Some(snap) = &a.snapshot {
+                                        // 按用户设置的前/后帧数从最大窗口快照中截取；新中心下标让
+                                        // 异常点 x 仍等于真实帧号，x_bounds=[frame-前N, frame+后N]。
+                                        let (snap_view, center_view) =
+                                            verify_slice_snapshot(snap, a.snap_center, before, after);
+                                        let x0 = verify_real_x_base(a.frame_no, center_view);
+                                        let series: Vec<(Option<String>, Vec<f64>, usize, f64)> = snap_view
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, col)| {
+                                                (
+                                                    Some(format!("CH{}", i + 1)),
+                                                    col.iter().map(|&v| v as f64).collect(),
+                                                    i,
+                                                    x0,
+                                                )
+                                            })
+                                            .collect();
+                                        // 大红圈标出异常帧各通道的实际值（x=真实帧号）；空心不遮数据点。
+                                        let marker_ys: Vec<f64> = snap_view
+                                            .iter()
+                                            .map(|col| {
+                                                col.get(center_view)
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    as f64
+                                            })
+                                            .collect();
+                                        let mut zoom = self.verify_zoom;
+                                        // 重置标志随 state 传递：本帧取用、绘图后写回，
+                                        // 不放在 FrameApp 上，避免链路中途丢失。
+                                        let mut reset = state.reset_bounds;
+                                        crate::ui::plot::draw_plot_with_id(
+                                            "verify_plot",
+                                            right,
+                                            1.5,
+                                            &series,
+                                            // 高度直接由整窗高度算，弹窗上下拖多大图就长多大。
+                                            verify_plot_height_from_window(window_h),
+                                            self.verify_epoch,
+                                            &mut zoom,
+                                            true, // 像主图暂停那样叠加实心数据点
+                                            Some((a.frame_no as f64, marker_ys)),
+                                            Some(verify_x_bounds(a.frame_no, before, after)),
+                                            &mut reset,
+                                            self.lang,
+                                        );
+                                        self.verify_zoom = zoom;
+                                        state.reset_bounds = reset;
+                                    } else {
+                                        right.label(tr(self.lang, "verify_no_snapshot"));
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+        if open {
+            self.verify = Some(state);
+        } else {
+            self.verify = None;
+            self.verify_rx = None;
         }
     }
 
@@ -1104,6 +1913,13 @@ impl FrameApp {
     fn spawn_pick(&mut self, kind: PickKind) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            if kind == PickKind::Verify {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Text", &["txt", "log", "hex"])
+                    .pick_file();
+                let _ = tx.send(picked);
+                return;
+            }
             let dialog = match kind {
                 PickKind::Csv => rfd::FileDialog::new()
                     .set_file_name("extracted.csv")
@@ -1111,6 +1927,7 @@ impl FrameApp {
                 PickKind::Txt => rfd::FileDialog::new()
                     .set_file_name("raw.txt")
                     .add_filter("Text", &["txt"]),
+                PickKind::Verify => unreachable!(),
             };
             let _ = tx.send(dialog.save_file());
         });
@@ -1141,6 +1958,8 @@ impl FrameApp {
                     self.raw_enabled = true;
                 }
                 (PickKind::Txt, None) => self.raw_enabled = false,
+                (PickKind::Verify, Some(p)) => self.start_verify(p),
+                (PickKind::Verify, None) => {}
             }
         }
     }
@@ -1463,22 +2282,47 @@ impl FrameApp {
         if row_ap.clicked() {
             self.apply_frame_config();
         }
-        // 原始数据绘图 | 剪贴板数据绘图（各占一半）
-        ui.horizontal(|ui| {
-            let half = (ui.available_width() - 8.0) / 2.0;
-            if ui
-                .add_sized([half, 24.0], egui::Button::new(tr(self.lang, "load_file")))
-                .clicked()
-            {
-                self.load_file_offline();
-            }
-            if ui
-                .add_sized([half, 24.0], egui::Button::new(tr(self.lang, "analyze_clip")))
-                .clicked()
-            {
-                self.analyze_clipboard();
+        // 原始数据绘图 | 剪贴板绘图 | 数据验算（三等分；字号适中，中英文都不撑宽左栏）
+        let lang = self.lang;
+        let mut clicked = [false; 3];
+        ui.columns(3, |cols| {
+            let keys = ["load_file", "analyze_clip", "verify_btn"];
+            for (i, col) in cols.iter_mut().enumerate() {
+                let key = keys[i];
+                let t = tr(lang, key);
+                #[cfg(test)]
+                {
+                    let galley = col.fonts(|f| {
+                        f.layout_no_wrap(
+                            t.to_owned(),
+                            egui::FontId::proportional(OFFLINE_BTN_FONT_SIZE),
+                            egui::Color32::WHITE,
+                        )
+                    });
+                    assert!(
+                        galley.rect.width() + 6.0 <= col.available_width(),
+                        "三按钮文案应放得下（不撑宽左栏）: {} w={} slot={}",
+                        t,
+                        galley.rect.width(),
+                        col.available_width()
+                    );
+                }
+                // 三按钮完全同款：普通暗色按钮，不做 accent/白字特殊处理。
+                let btn = egui::Button::new(egui::RichText::new(t).size(OFFLINE_BTN_FONT_SIZE));
+                if col.add_sized([col.available_width(), 24.0], btn).clicked() {
+                    clicked[i] = true;
+                }
             }
         });
+        if clicked[0] {
+            self.load_file_offline();
+        }
+        if clicked[1] {
+            self.analyze_clipboard();
+        }
+        if clicked[2] {
+            self.spawn_pick(PickKind::Verify);
+        }
     }
 
     /// 左栏组 4：通道配置（通道数+应用 → 色标图例 → 通道行）。
@@ -1937,6 +2781,7 @@ impl FrameApp {
             send_text: self.send_text.clone(),
             cmd_list: self.cmd_list.clone(),
             cmd_interval_ms: self.cmd_interval_ms,
+            verify_split_w: self.verify_split_w,
         };
         if let Ok(s) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(Self::config_path(), s);
@@ -2007,6 +2852,8 @@ impl FrameApp {
         if cfg.cmd_interval_ms > 0 {
             self.cmd_interval_ms = cfg.cmd_interval_ms;
         }
+        // 可拖动分隔线位置：老配置缺省已由 serde 填 160，这里再 clamp 防坏值。
+        self.verify_split_w = verify_split_width(920.0, cfg.verify_split_w);
     }
 
     /// 原始视图：`序号: XX XX XX` 每帧一行（Python raw_text 语义，最多 1000 行）。
@@ -2041,9 +2888,10 @@ impl FrameApp {
     /// 所以中英切换后无需重新点「应用」，两格会立刻跟着变。
     /// 注：错误明细文本来自配置解析，目前本身是中文（全项目错误信息统一为中文硬编码），
     /// 这里只让「配置错误 / Config Error」前缀跟随语言。
-    fn config_receipt_text(&self, r: &ConfigReceipt) -> String {
+    /// none_text 由调用方按格传入：帧配置格与通道配置格未应用时显示不同文案。
+    fn config_receipt_text(&self, r: &ConfigReceipt, none_text: &str) -> String {
         match r {
-            ConfigReceipt::None => "—".to_string(),
+            ConfigReceipt::None => none_text.to_string(),
             ConfigReceipt::FrameApplied => tr(self.lang, "frame_applied").to_string(),
             ConfigReceipt::ChannelApplied(n) => {
                 format!("{} ({})", tr(self.lang, "channel_applied"), n)
@@ -2055,10 +2903,10 @@ impl FrameApp {
     }
 
     fn frame_cell_text(&self) -> String {
-        self.config_receipt_text(&self.frame_msg)
+        self.config_receipt_text(&self.frame_msg, tr(self.lang, "frame_unconfigured"))
     }
     fn channel_cell_text(&self) -> String {
-        self.config_receipt_text(&self.channel_msg)
+        self.config_receipt_text(&self.channel_msg, tr(self.lang, "channel_unconfigured"))
     }
 
     /// 状态栏从左到右 11 格文本（最后一格是 TX）。
@@ -2080,7 +2928,6 @@ impl FrameApp {
     }
 
     fn status_cells(&self) -> Vec<String> {
-        let dash = "—".to_string();
         // ①连接格：一次性连接错误优先，否则回落到常驻「已连接/未连接」
         let conn = if self.link_msg.is_empty() {
             tr(self.lang, if self.connected { "connected" } else { "not_connected" }).to_string()
@@ -2092,13 +2939,21 @@ impl FrameApp {
         let channel_cfg = self.channel_cell_text();
         // ④通道信息：已应用配置的位宽与正负
         let chan_info = self.channel_info_text();
-        // ⑤校验同步状态：只在「无帧头 + 开校验」时有意义
-        let sync = if self.engine.checksum_mode != ChecksumMode::None
-            && self.engine.frame_header.is_empty()
-        {
-            tr(self.lang, if self.engine.sync_locked { "chk_synced" } else { "chk_sync" }).to_string()
-        } else {
-            String::new()
+        // ⑤校验格：显示选中的校验模式（no / 校验8位 / 校验16位），让人一眼看出配置生效。
+        // 无帧头 + 开校验时才附同步后缀（·待同步 / ·已同步）：同步状态只在无帧头时有意义，
+        // 有帧头靠帧头切帧，不显示同步。后缀两态互斥，共用这一格，不会同时出现。
+        let sync = match self.engine.checksum_mode {
+            ChecksumMode::None => tr(self.lang, "chk_no").to_string(),
+            ChecksumMode::Sum8 | ChecksumMode::Sum16 => {
+                let is8 = self.engine.checksum_mode == ChecksumMode::Sum8;
+                let mode = tr(self.lang, if is8 { "chk_mode8" } else { "chk_mode16" });
+                if self.engine.frame_header.is_empty() {
+                    let tail = tr(self.lang, if self.engine.sync_locked { "chk_synced" } else { "chk_sync" });
+                    format!("{}·{}", mode, tail)
+                } else {
+                    mode.to_string()
+                }
+            }
         };
         // ⑥⑦⑧计数常驻显示（没有也显示 0，不再留空）
         let chk = format!("{} {}", tr(self.lang, "chk_err"), self.engine.checksum_errors);
@@ -2108,22 +2963,29 @@ impl FrameApp {
         } else {
             format!("Frames: {}", self.engine.frame_count)
         };
-        // ⑩跳变（循环码跳号累计）：常驻显示，0 也显示
+        // ⑧跳变（循环码跳号累计）：常驻显示，0 也显示。按用户要求放在帧数前面。
         let jumps = format!("{} {}", tr(self.lang, "cycle_jumps_short"), self.engine.cycle_jumps);
-        // ⑪最近操作：回环测试运行中固定显示「回环测试中」；其余一次性回执约 3 秒后消失。
+        // ⑪最近操作：回环测试中固定显示；一次性回执约 3 秒后消失；空闲则轮播快捷提示。
         let recent = if self.loopback_enabled && self.cmd_loop {
             tr(self.lang, "loopback_running").to_string()
         } else if self.status_msg.is_empty() || self.status_msg_expired() {
-            dash
+            let idx = status_tip_index(
+                self.status_tip_epoch.elapsed().as_secs(),
+                STATUS_TIP_KEYS.len(),
+            );
+            tr(self.lang, STATUS_TIP_KEYS[idx]).to_string()
         } else {
             self.status_msg.clone()
         };
         let tx = format!("TX: {}", self.tx_count);
-        vec![conn, frame_cfg, channel_cfg, chan_info, sync, chk, lost, frames, jumps, recent, tx]
+        // 顺序按用户定稿：连接 | 帧配置 | 校验同步 | 通道配置 | 通道信息 | 校验错 | 丢帧 | 跳变 | 帧数 | 最近操作 | TX
+        // 校验紧跟帧配置（校验本就是帧配置的一部分），通道配置紧跟通道信息（位宽/符号是通道的结果）。
+        vec![conn, frame_cfg, sync, channel_cfg, chan_info, chk, lost, jumps, frames, recent, tx]
     }
 
     /// 通道信息格：位宽按已应用的 Idx 字节数 × 8，正负按 ± 是否为 -1。
-    /// 位宽混 → 「8/16位 混合」；位宽一致但符号混 → 「16位 混合」。
+    /// 位宽与符号紧贴无空格：中文「8位有符号」，英文缩写「8sig / 8unsig」。
+    /// 位宽混 → 「8/16位混合」；位宽一致但符号混 → 「16位混合」。
     fn channel_info_text(&self) -> String {
         let mut bits: Vec<u32> = Vec::new();
         let mut signed: Vec<bool> = Vec::new();
@@ -2141,10 +3003,10 @@ impl FrameApp {
         uniq.dedup();
         let zh = self.lang == Lang::Zh;
         let bit_word = if uniq.len() == 1 {
-            if zh { format!("{}位", uniq[0]) } else { format!("{}bit", uniq[0]) }
+            if zh { format!("{}位", uniq[0]) } else { uniq[0].to_string() }
         } else {
             let list = uniq.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("/");
-            if zh { format!("{}位", list) } else { format!("{}bit", list) }
+            if zh { format!("{}位", list) } else { list }
         };
         let all_signed = signed.iter().all(|&s| s);
         let all_unsigned = signed.iter().all(|&s| !s);
@@ -2155,7 +3017,8 @@ impl FrameApp {
         } else {
             tr(self.lang, "unsigned")
         };
-        format!("{} {}", bit_word, sign_word)
+        // 中英都紧贴无空格：中文「8位有符号」，英文前缀已含 bit 缩写（8bit→8sig）。
+        format!("{}{}", bit_word, sign_word)
     }
 
     /// 状态行：按 status_cells() 的顺序铺开，每格贴合当前文字、不做均摊。
@@ -2164,7 +3027,7 @@ impl FrameApp {
     fn status_line(&mut self, ui: &mut egui::Ui) {
         let dim = self.style.text_dim();
         let accent = self.style.accent_color();
-        let cells = self.status_cells(); // 11 格：[0连接][1帧配置][2通道配置][3通道信息][4校验同步][5校验错][6丢帧][7帧数][8跳变][9最近操作][10TX]
+        let cells = self.status_cells(); // 11 格：[0连接][1帧配置][2校验同步][3通道配置][4通道信息][5校验错][6丢帧][7跳变][8帧数][9最近操作][10TX]
         let left_texts: Vec<&str> = cells[..9].iter().map(|s| s.as_str()).collect();
         let recent_text = cells[9].clone();
         let tx_text = cells[10].clone();
@@ -2179,14 +3042,16 @@ impl FrameApp {
             tr(self.lang, "connected"),
             tr(self.lang, "not_connected"),
         ]) + 2.0;
-        // 下限：数字格（5 校验错 / 6 丢帧 / 7 帧数 / 8 跳变）保底不压；
+        // 下限：数字格（5 校验错 / 6 丢帧 / 7 跳变 / 8 帧数）保底不压；
         // 空格子留最小占位；其余给适度下限，空间不够时优先让位。
+        // 换序后：1帧配置、2校验同步、3通道配置、4通道信息；校验同步本无下限，不套 56。
         let mut lower: Vec<f32> = vec![
             conn_min.min(w[0]),
             w[1].min(56.0),
-            w[2].min(56.0),
-            w[3].min(48.0),
-            w[4], w[5], w[6], w[7], w[8],
+            w[2],
+            w[3].min(56.0),
+            w[4].min(48.0),
+            w[5], w[6], w[7], w[8],
         ];
         for i in 0..9 {
             if left_texts[i].is_empty() || left_texts[i] == "—" {
@@ -2196,18 +3061,31 @@ impl FrameApp {
         }
         // 记录灯固定宽度（不随状态跳动）
         let light_w: f32 = 76.0;
-        // 右排：最近操作 + TX，各自固定宽、文字靠右，TX 最右且不额外吃剩余宽度
-        let recent_w = labels_width(ui, &[recent_text.as_str(), tr(self.lang, "rec_wait_conn"), tr(self.lang, "rec_saving")]) + 2.0;
+        // 绘图状态格固定宽：「实时绘图 / 绘图已暂停」取较宽者，切换时不跳动。
+        let plot_state_w = labels_width(
+            ui,
+            &[tr(self.lang, "plot_state_live"), tr(self.lang, "plot_state_paused")],
+        ) + 4.0;
+        // 右排：最近操作（轮播提示/一次性回执）+ TX。最近操作设宽度上限，
+        // 超长回执截断 + 悬停看全文，绝不再把 TX 挤出状态栏。
+        let recent_w = labels_width(ui, &[
+            recent_text.as_str(),
+            tr(self.lang, "rec_wait_conn"),
+            tr(self.lang, "rec_saving"),
+        ]).min(RECENT_MAX_W) + 2.0;
         let tx_w = labels_width(ui, &[tx_text.as_str(), "TX: 0000000"]) + 4.0;
 
-        // 分隔线：左 9 格间 8 条 + 灯前 1 条 + 右排前 1 条 = 10 条
+        // 分隔线：左 9 格间 8 条 + 绘图状态前 1 条 + 记录灯前 1 条 = 10 条
         let seps: f32 = sep_w * 10.0;
-        let gaps: f32 = sp * 11.0 + 4.0;
-        let left_avail = (ui.available_width() - light_w - recent_w - tx_w - seps - gaps).max(0.0);
+        let gaps: f32 = sp * 12.0 + 4.0;
+        let left_avail = (ui.available_width()
+            - plot_state_w - light_w - recent_w - tx_w - seps - gaps)
+            .max(0.0);
         let mut need: f32 = w.iter().sum();
         // 压缩优先级（从最不重要开始）：通道信息 → 帧配置 → 通道配置 → 同步 → 连接；
+        // 换序后索引：通道信息 4、帧配置 1、通道配置 3、同步 2、连接 0。
         // 数字格 5/6/7/8 保底不压；最近操作已挪到右排可整体让位。
-        let order: [usize; 5] = [3, 1, 2, 4, 0];
+        let order: [usize; 5] = [4, 1, 3, 2, 0];
         if need > left_avail {
             for &i in &order {
                 if need <= left_avail {
@@ -2224,7 +3102,7 @@ impl FrameApp {
                 if i > 0 {
                     ui.add_sized([sep_w, h], egui::Separator::default().vertical().spacing(sep_w));
                 }
-                let color = if i == 8 { accent } else { dim };
+                let color = if i == 7 { accent } else { dim }; // 跳变格保持主色强调（换位置后索引 7）
                 let resp = ui.add_sized(
                     [w[i], h],
                     egui::Label::new(egui::RichText::new(*text).color(color))
@@ -2235,6 +3113,9 @@ impl FrameApp {
                     let _ = resp.on_hover_text(*text);
                 }
             }
+            // 绘图状态：常驻两态，暂停时红色呼吸提醒（独立 widget，不进 status_cells 文本数组）
+            ui.add_sized([sep_w, h], egui::Separator::default().vertical().spacing(sep_w));
+            self.draw_plot_state(ui, plot_state_w, h);
             // 记录指示灯（独立 widget，不进 status_cells 文本数组）
             ui.add_sized([sep_w, h], egui::Separator::default().vertical().spacing(sep_w));
             self.draw_record_light(ui, light_w, h);
@@ -2243,15 +3124,27 @@ impl FrameApp {
             if remain > 0.0 {
                 ui.add_space(remain);
             }
-            // 右排：最近操作（靠右）
+            // 右排：最近操作（靠右）。空闲轮播用更淡的灰，与真正的一次性回执区分。
+            let tip_now = !self.loopback_enabled || !self.cmd_loop;
+            let idle_tip = tip_now
+                && (self.status_msg.is_empty() || self.status_msg_expired());
+            let recent_color = if idle_tip {
+                egui::Color32::from_gray(120)
+            } else {
+                dim
+            };
             let r_resp = ui.add_sized(
                 [recent_w, h],
-                egui::Label::new(egui::RichText::new(recent_text.as_str()).color(dim))
+                egui::Label::new(egui::RichText::new(recent_text.as_str()).color(recent_color))
                     .truncate()
                     .halign(egui::Align::RIGHT),
             );
-            if !recent_text.is_empty() && recent_text != "—" {
+            if !recent_text.is_empty() {
                 let _ = r_resp.on_hover_text(recent_text.as_str());
+            }
+            // 空闲轮播需要持续重绘，否则窗口无事件时文字不换。
+            if idle_tip {
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
             // TX 最右
             ui.add_sized(
@@ -2261,6 +3154,30 @@ impl FrameApp {
                     .halign(egui::Align::RIGHT),
             );
         });
+    }
+
+    /// 状态栏「绘图状态」：常驻两态。实时绘图=暗色小字、无任何特殊效果；绘图已暂停=
+    /// 红色呼吸闪烁（持续请求重绘），避免误点暂停后不知道为什么不画图。
+    fn draw_plot_state(&self, ui: &mut egui::Ui, w: f32, h: f32) {
+        let dim = self.style.text_dim();
+        let paused = self.plot_paused;
+        let text = tr(
+            self.lang,
+            if paused { "plot_state_paused" } else { "plot_state_live" },
+        );
+        let rich = if paused {
+            // 呼吸幅度约 0.47Hz：红色在深红与亮红之间来回，一眼能看到在动。
+            let t = ui.input(|i| i.time);
+            let pulse = (((t * 3.0).sin() + 1.0) * 0.5) as f32; // 0..1
+            let r = 0xC0 + (0x3F as f32 * pulse) as u8;
+            let g = 0x30 + (0x40 as f32 * pulse) as u8;
+            let b = 0x30 + (0x20 as f32 * pulse) as u8;
+            ui.ctx().request_repaint();
+            egui::RichText::new(text).strong().color(egui::Color32::from_rgb(r, g, b))
+        } else {
+            egui::RichText::new(text).color(dim)
+        };
+        ui.add_sized([w, h], egui::Label::new(rich).truncate().halign(egui::Align::LEFT));
     }
 
     /// 状态栏「记录中」指示灯：亮=任一保存正在写（csv_recording||txt_recording），灰=未记录。
@@ -2372,16 +3289,17 @@ impl FrameApp {
             .show(ctx, |ui| {
                 ui.label("1. 连接区选择 Serial/UDP，串口选端口+波特率（下拉选择）+校验位(None/Even/Odd，改后需重连)，UDP 填本机IP:端口监听；连接失败会弹窗提示具体原因。");
                 ui.label("2. 帧配置：帧头可空（定长切帧）、校验下拉（no=无校验，8=SUM 8位，16=SUM 16位）：从帧头第 1 字节累加到校验字节前，8=和取低 8 位与帧最后 1 字节比对，16=和取低 16 位与帧最后 2 字节比对（高低字节跟随字节序设置）；校验失败的帧整帧丢弃，状态栏显示「校验错 N」计数；帧长、字节序、样本/帧、最大点数，点「应用帧配置」生效；循环码：填帧内字节序号（从 1 起算，第一字节填 1，与帧长口径一致）+ 位宽（8/16/24/32），软件每帧读一次循环码，跳号就按差值累计丢帧、号码重复记异常，状态栏只显示一个「丢帧 N」总数（未启用循环码时按校验错 + 对齐时悄悄跳过的帧数估算），通道配置下方多了「循环码计数」明细框；留空位置=关闭，位置加字节数超出帧长会明确报错；调试时设备重启或断开重连会让循环码从 0 重来，在「循环码计数」框点「清零」即可把计数和比较基准一起归零、下一帧重新起算（软件不猜回退，号码倒着走一律按差值计，忘了清零会看到偏大的丢帧数）；");
-                ui.label("   ★ 无帧头 + 启用校验时：收到的数据可能是任意字节开头，软件会用「连续两帧校验都正确」来确认分帧起点（单帧通过可能是巧合），对齐前不画图，状态栏显示「等待校验同步」；对齐后正常解析，连续 3 帧校验失败会自动重新搜索对齐。");
+                ui.label("   ★ 无帧头 + 启用校验时：收到的数据可能是任意字节开头，软件会用「连续两帧校验都正确」来确认分帧起点（单帧通过可能是巧合），对齐前不画图，状态栏显示「校验N位·待同步」；对齐后正常解析，连续 3 帧校验失败会自动重新搜索对齐。");
                 ui.label("3. 通道配置：填通道数点「应用」，每行 Idx 填字节索引（支持 , 空格 中文逗号 顿号），± 为符号位(-1=无，Idx 填完自动算)，Dif 勾选=原始线+差分虚线叠加；");
                 ui.label("4. 离线绘图：帧配置好后点「载入文件」或「分析剪贴板」，把 hex 文本直接绘图；");
                 ui.label("5. 数据记录：勾选提取数据保存(CSV)/原始数据保存(TXT)，未选文件时自动弹出保存对话框；路径标签悬停可看完整路径；");
                 ui.label("6. 绘图工具栏：🏠 恢复原视图、➕/➖ 缩放、🗑 清空（顺带把 TX 计数归零）、⏸ 暂停绘图（数据照常解析，暂停时显示数据点圆点），▶ 恢复实时；");
-                ui.label("7. 命令发送：手动填若干条命令，设间隔(ms)后 ▶ 自动循环轮发，或逐条点「发送」；HEX/ASCII 跟随发送行格式开关；");
+                ui.label("7. 批量发送（原命令发送）：手动填若干条命令，设间隔(ms)后 ▶ 自动循环轮发，或逐条点「发送」；HEX/ASCII 跟随发送行格式开关；");
                 ui.label(tr(self.lang, "loopback_help"));
                 ui.label("8. 配置自动保存：帧配置/通道配置/语言/主题/波特率/校验位/命令列表存 exe 同目录 .config.json，退出和应用时写回，重启自动恢复；");
                 ui.label("9. 🌙 循环切换 8 套主题（深色→原始→淡绿→淡蓝→米黄→粉色→Mac→Win），窗口标题栏跟随（Win11）；");
                 ui.label("10. F12 界面微调：左栏宽度，保存到 ui_style.json。");
+                ui.label("12. 数据验算：帧配置区点「数据验算」选原始数据 txt，软件流式读取并按当前帧配置分帧、算循环码，找出丢帧发生在哪一段；弹窗列出每条异常（帧号/期望→实际/丢帧数），点一条在下方画出该点前后各 N 帧的通道曲线（默认 50，可在弹窗内改 1~500，不覆盖主图）；大文件也不卡界面。验算前请确认帧配置与当时采数一致：校验=no、循环码位置=帧长（1 起算末字节）、位宽=8；循环码位置留空则无法验算。");
             });
         self.show_help = open;
     }
@@ -2513,6 +3431,7 @@ impl FrameApp {
         self.style.apply_text_styles(ctx);
         self.poll_link();
         self.poll_pick();
+        self.poll_verify();
         self.poll_cmd_loop();
 
         // 底部状态行：横贯整个窗口（含左栏下方），标准状态栏形态
@@ -2644,6 +3563,7 @@ impl FrameApp {
                                         self.plot_epoch,
                                         &mut self.plot_zoom,
                                         self.plot_paused,
+                                        self.lang,
                                     )
                                 })
                                 .inner;
@@ -2698,6 +3618,7 @@ impl FrameApp {
         self.help_window(ctx);
         self.history_window(ctx);
         self.err_dialog_window(ctx);
+        self.verify_window(ctx);
         self.style
             .debug_panel(ctx, &mut self.show_style_panel, &mut self.style_dirty);
         self.style.apply_text_styles(ctx);
@@ -2785,6 +3706,130 @@ fn parse_cycle_width(s: &str) -> u8 {
 }
 
 /// 十六进制色快捷解析（非法值回退）
+/// 把 i18n 模板里的 `{}` 依次换成数字（format! 要求字面量模板，不能直接用 tr 结果）。
+fn fmt_nums(tpl: &str, nums: &[u64]) -> String {
+    let mut s = tpl.to_string();
+    for n in nums {
+        s = s.replacen("{}", &n.to_string(), 1);
+    }
+    s
+}
+
+/// 把 i18n 模板里的第一个 `{}` 换成字符串（底层错误细节 / 路径等）。
+fn fmt_str(tpl: &str, s: &str) -> String {
+    tpl.replacen("{}", s, 1)
+}
+
+/// 验算快照图的 x 基准：用真实帧号，异常点（快照下标 center）落在 x=frame_no。
+/// 第 i 个点的 x = (frame_no - center) + i，前后两点都是真实帧号，鼠标读数即真实帧号。
+fn verify_real_x_base(frame_no: u64, center: usize) -> f64 {
+    frame_no as f64 - center as f64
+}
+
+/// 验算「前/后 N 帧」输入框取值：非法/空回退 50，clamp 到 1..=VERIFY_SNAP_MAX。
+fn verify_frames_from_text(text: &str) -> usize {
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .unwrap_or(50)
+        .min(VERIFY_SNAP_MAX)
+}
+
+/// 验算快照图的 x 范围：以真实帧号 frame_no 为中心，前 before / 后 after 帧。
+/// 早期帧下界可能为负（代表第 1 帧之前的虚拟位置），保留负数不做 clamp，
+/// 保证异常点 x=frame_no 始终严格居中；透明辅助线用首末值平延撑开该范围。
+fn verify_x_bounds(frame_no: u64, before: usize, after: usize) -> [f64; 2] {
+    let f = frame_no as f64;
+    [f - before as f64, f + after as f64]
+}
+
+/// 按用户设置的「前/后 N 帧」从最大窗口快照中截取一段，返回（按通道分组的片段, 新中心下标）。
+/// 新中心下标用于复用 verify_real_x_base：异常点 x 仍等于真实帧号。
+fn verify_slice_snapshot(
+    snap: &[Vec<i64>],
+    center: usize,
+    before: usize,
+    after: usize,
+) -> (Vec<Vec<i64>>, usize) {
+    let len = snap.first().map_or(0, |c| c.len());
+    if len == 0 {
+        return (Vec::new(), 0);
+    }
+    let start = center.min(len).saturating_sub(before);
+    let end = center.saturating_add(after).saturating_add(1).min(len);
+    let new_center = center.saturating_sub(start);
+    (snap.iter().map(|c| c[start..end].to_vec()).collect(), new_center)
+}
+
+/// 验算结论文案（配置错误/无循环码由 state.msg 优先处理，不进这里）。
+/// 返回 (文案, 是否警告)：None = 有异常，走「发现 N 处异常」标题。
+/// 关键：数据含非法字符时优先于「未发现丢帧」，烂数据不能被当成正常数据。
+fn verify_result_hint(
+    lang: Lang,
+    has_invalid_char: bool,
+    anomaly_count: usize,
+) -> Option<(String, bool)> {
+    if has_invalid_char {
+        Some((tr(lang, "verify_invalid_data").to_string(), true))
+    } else if anomaly_count == 0 {
+        Some((tr(lang, "verify_no_loss").to_string(), false))
+    } else {
+        None
+    }
+}
+
+/// 验算快照图高度底层计算：不低于绘图正方形下限 VERIFY_PLOT_MIN_SIZE。
+/// 由 verify_plot_height_from_window 用整窗高度调用；主绘图区高度逻辑不动。
+fn verify_plot_height(available: f32) -> f32 {
+    available.max(VERIFY_PLOT_MIN_SIZE)
+}
+
+/// 验算弹窗绘图高度：直接由整窗内容高度计算（减顶部固定开销），不依赖嵌套 Ui 的
+/// available_height（在 ui.vertical / columns 中可能是受限值，导致图高卡住）。
+/// 不额外留底部余量：让绘图底边（帧号轴）正好落在弹窗下边界上。
+/// 没有上限：弹窗拖多高图就跟着长多高；下限 VERIFY_PLOT_MIN_SIZE 的正方形。
+fn verify_plot_height_from_window(window_h: f32) -> f32 {
+    verify_plot_height(window_h - VERIFY_TOP_OVERHEAD)
+}
+
+/// 可拖动分隔线位置：把期望左栏宽 desired clamp 到 [160, total-260]，
+/// 保证绘图区至少 260px。拖动增量与配置恢复都走这一个纯函数。
+fn verify_split_width(total: f32, desired: f32) -> f32 {
+    let max_w = (total - VERIFY_SPLIT_RIGHT_MIN).max(VERIFY_SPLIT_MIN);
+    desired.clamp(VERIFY_SPLIT_MIN, max_w)
+}
+
+/// 透明度百分比 → Color32 的 alpha（unpremultiplied，0..255）。
+/// 先 clamp 到 20..=100 再四舍五入：80→204、100→255、20→51。
+/// 100% 时 alpha=255，配合原 window_fill 的 rgb，观感与加 fill 前完全一致。
+fn verify_opacity_alpha(pct: u8) -> u8 {
+    let p = pct.clamp(VERIFY_OPACITY_MIN, VERIFY_OPACITY_MAX) as u32;
+    ((p * 255 + 50) / 100) as u8
+}
+
+/// 纯函数：三类重置事件（换异常条目 / 改前后帧数 / 验算完成）任一发生即要求下一帧重置坐标。
+fn verify_reset_on_event(select_changed: bool, frames_changed: bool, done: bool) -> bool {
+    select_changed || frames_changed || done
+}
+
+/// 「原始数据绘图」文件对话框的扩展名白名单：CSV 不是原始数据，必须排除。
+const OFFLINE_TEXT_EXTS: &[&str] = &["txt", "hex", "log"];
+
+/// 判断一段文本是不是 CSV（导出表头）：首行以 `Frame,` 开头，或含逗号表头。
+fn is_csv_text(text: &str) -> bool {
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('\u{feff}');
+    if first.starts_with("Frame,") {
+        return true;
+    }
+    first.contains(',') && first.to_ascii_lowercase().contains("frame")
+}
+
 fn hex_or(s: &str, fallback: egui::Color32) -> egui::Color32 {
     egui::Color32::from_hex(s).unwrap_or(fallback)
 }
@@ -3043,7 +4088,7 @@ mod layout_tests {
     fn status_bar_cells_order_and_always_zero() {
         let mut app = FrameApp::new();
         let c = app.status_cells();
-        // 11 格：连接/帧配置/通道配置/通道信息/校验同步/校验错/丢帧/帧数/跳变/最近操作/TX
+        // 11 格：连接/帧配置/校验同步/通道配置/通道信息/校验错/丢帧/跳变/帧数/最近操作/TX
         assert_eq!(c.len(), 11);
         assert_eq!(c[0], tr(app.lang, "not_connected"));
         // 开机时两格不该出现「已应用」回执：启动只是悄悄装配配置，
@@ -3051,40 +4096,67 @@ mod layout_tests {
         // 是否有残留配置（配置损坏时开机显示错误提示是合理的，也允许）。
         assert!(
             !matches!(app.frame_msg, ConfigReceipt::FrameApplied),
-            "开机不该显示「帧配置已应用」: {:?}",
+            "开机不该显示「帧格式已配置」: {:?}",
             app.frame_msg
         );
         assert!(
             !matches!(app.channel_msg, ConfigReceipt::ChannelApplied(_)),
-            "开机不该显示「通道配置已应用」: {:?}",
+            "开机不该显示「通道已配置」: {:?}",
             app.channel_msg
         );
-        // 配置正常时，两格留白显示「—」
+        // 未点应用时两格给出明确文案，不再是留白「—」
         if app.frame_msg == ConfigReceipt::None {
-            assert_eq!(c[1], "—");
+            assert_eq!(c[1], tr(app.lang, "frame_unconfigured"));
         }
         if app.channel_msg == ConfigReceipt::None {
-            assert_eq!(c[2], "—");
+            assert_eq!(c[3], tr(app.lang, "channel_unconfigured"));
         }
-        assert!(c[4].is_empty(), "未开校验时校验状态留白");
+        // 校验同步已挪到索引 2，紧跟帧配置
+        assert_eq!(c[2], tr(app.lang, "chk_no"), "未开校验时明确写「无校验」，不留空白");
         assert!(c[5].ends_with('0'), "校验错常驻 0: {:?}", c[5]);
         assert!(c[6].ends_with('0'), "丢帧常驻 0: {:?}", c[6]);
-        assert!(c[7].contains('0'), "帧数常驻: {:?}", c[7]);
-        // 第 9 格（索引 8）= 跳变 N，0 也常驻显示
+        // 第 8 格（索引 7）= 跳变 N，0 也常驻显示（按用户要求与帧数换位）
         assert!(
-            c[8].contains(&tr(app.lang, "cycle_jumps_short")) && c[8].ends_with('0'),
+            c[7].contains(&tr(app.lang, "cycle_jumps_short")) && c[7].ends_with('0'),
             "跳变常驻 0: {:?}",
-            c[8]
+            c[7]
         );
-        // 第 10 格（索引 9）= 最近操作，空时显示 —
-        assert_eq!(c[9], "—", "最近操作空时显示 —");
+        // 第 9 格（索引 8）= 帧数
+        assert!(c[8].contains('0'), "帧数常驻: {:?}", c[8]);
+        // 第 10 格（索引 9）= 最近操作，空闲时轮播快捷提示（不再是 —）
+        assert!(
+            STATUS_TIP_KEYS.iter().any(|k| tr(app.lang, k) == c[9]),
+            "空闲时应显示轮播提示之一: {:?}",
+            c[9]
+        );
         // 第 11 格（索引 10）= TX: 0
         assert_eq!(c[10], "TX: 0");
+        // 校验格：显示所选模式；无帧头时才附互斥的同步后缀，有帧头只显示模式。
         app.engine.checksum_mode = ChecksumMode::Sum8;
+        app.engine.frame_header = Vec::new(); // 无帧头 → 附同步后缀
         app.engine.sync_locked = false;
-        assert_eq!(app.status_cells()[4], tr(app.lang, "chk_sync"));
+        assert_eq!(
+            app.status_cells()[2],
+            format!("{}·{}", tr(app.lang, "chk_mode8"), tr(app.lang, "chk_sync"))
+        );
         app.engine.sync_locked = true;
-        assert_eq!(app.status_cells()[4], tr(app.lang, "chk_synced"));
+        assert_eq!(
+            app.status_cells()[2],
+            format!("{}·{}", tr(app.lang, "chk_mode8"), tr(app.lang, "chk_synced"))
+        );
+        // 有帧头：靠帧头切帧，不显示同步后缀
+        app.engine.frame_header = vec![0xEB, 0x90];
+        assert_eq!(app.status_cells()[2], tr(app.lang, "chk_mode8"));
+        // Sum16 带 16 位前缀
+        app.engine.checksum_mode = ChecksumMode::Sum16;
+        app.engine.frame_header = Vec::new();
+        assert_eq!(
+            app.status_cells()[2],
+            format!("{}·{}", tr(app.lang, "chk_mode16"), tr(app.lang, "chk_synced"))
+        );
+        // no → 无校验，不带任何前缀/后缀
+        app.engine.checksum_mode = ChecksumMode::None;
+        assert_eq!(app.status_cells()[2], tr(app.lang, "chk_no"));
     }
 
     #[test]
@@ -3097,16 +4169,17 @@ mod layout_tests {
         let c = app.status_cells();
         assert_eq!(c[0], "未发现串口设备");
         assert_eq!(c[1], tr(app.lang, "frame_applied"));
-        assert_eq!(c[2], format!("{} (4)", tr(app.lang, "channel_applied")));
+        // 通道配置从索引 2 挪到索引 3
+        assert_eq!(c[3], format!("{} (4)", tr(app.lang, "channel_applied")));
         // 最近操作在第 10 格（索引 9）
         assert_eq!(c[9], "主题: 深色");
         app.status_msg.clear();
         let c2 = app.status_cells();
         assert_eq!(c2[1], tr(app.lang, "frame_applied"), "清最近操作不应顶掉帧配置回执");
-        assert_eq!(c2[2], format!("{} (4)", tr(app.lang, "channel_applied")));
+        assert_eq!(c2[3], format!("{} (4)", tr(app.lang, "channel_applied")));
     }
 
-    /// 回归：开机不该冒充用户点过「应用」而显示「帧配置已应用」。
+    /// 回归：开机不该冒充用户点过「应用」而显示「帧格式已配置」。
     /// 启动只装配引擎不留回执；只有真正点「应用帧配置」后才出现，
     /// 且出现后仍要跟随中英切换（见 config_cells_follow_language_switch）。
     #[test]
@@ -3117,16 +4190,17 @@ mod layout_tests {
         let mut app = FrameApp::new();
         assert!(
             !matches!(app.frame_msg, ConfigReceipt::FrameApplied),
-            "开机不该显示「帧配置已应用」: {:?}",
+            "开机不该显示「帧格式已配置」: {:?}",
             app.frame_msg
         );
         assert!(
             !matches!(app.channel_msg, ConfigReceipt::ChannelApplied(_)),
-            "开机不该显示「通道配置已应用」: {:?}",
+            "开机不该显示「通道已配置」: {:?}",
             app.channel_msg
         );
-        // 无回执时渲染成留白「—」（纯渲染口径，不依赖磁盘状态）
-        assert_eq!(app.config_receipt_text(&ConfigReceipt::None), "—");
+        // 无回执时按格给出明确文案（纯渲染口径，不依赖磁盘状态）
+        assert_eq!(app.frame_cell_text(), tr(app.lang, "frame_unconfigured"));
+        assert_eq!(app.channel_cell_text(), tr(app.lang, "channel_unconfigured"));
 
         // 复位成合法配置，用户真正点「应用帧配置」后：回执才出现
         app.length_text = "11".into();
@@ -3172,21 +4246,21 @@ mod layout_tests {
         app.lang = Lang::Zh;
         let zh = app.status_cells();
         assert_eq!(zh[1], tr(Lang::Zh, "frame_applied"));
-        assert_eq!(zh[2], format!("{} ({})", tr(Lang::Zh, "channel_applied"), n));
+        assert_eq!(zh[3], format!("{} ({})", tr(Lang::Zh, "channel_applied"), n));
 
         // 切到英文：两格立即变英文，且不需要重新点「应用」
         app.lang = Lang::En;
         let en = app.status_cells();
         assert_eq!(en[1], tr(Lang::En, "frame_applied"));
-        assert_eq!(en[2], format!("{} ({})", tr(Lang::En, "channel_applied"), n));
+        assert_eq!(en[3], format!("{} ({})", tr(Lang::En, "channel_applied"), n));
         assert_ne!(en[1], zh[1], "帧配置格应随语言变化");
-        assert_ne!(en[2], zh[2], "通道配置格应随语言变化");
+        assert_ne!(en[3], zh[3], "通道配置格应随语言变化");
 
         // 切回中文：还原
         app.lang = Lang::Zh;
         let back = app.status_cells();
         assert_eq!(back[1], zh[1]);
-        assert_eq!(back[2], zh[2]);
+        assert_eq!(back[3], zh[3]);
 
         // 错误回执的前缀也跟随语言
         app.frame_msg = ConfigReceipt::Error("帧长不能为 0".into());
@@ -3290,17 +4364,32 @@ mod layout_tests {
             c.sig_text = "15".into();
         }
         app.apply_channel_config();
-        assert_eq!(app.channel_info_text(), "16位 有符号");
+        assert_eq!(app.channel_info_text(), "16位有符号");
         app.channels[1].sig_text = "-1".into();
         app.apply_channel_config();
-        assert_eq!(app.channel_info_text(), "16位 混合");
+        assert_eq!(app.channel_info_text(), "16位混合");
         app.channels[0].idx_text = "2".into();
         app.apply_channel_config();
-        assert_eq!(app.channel_info_text(), "8/16位 混合");
+        assert_eq!(app.channel_info_text(), "8/16位混合");
         app.channels[0].idx_text = "2,3".into();
         app.channels[0].sig_text = "-1".into();
         app.apply_channel_config();
-        assert_eq!(app.channel_info_text(), "16位 无符号");
+        assert_eq!(app.channel_info_text(), "16位无符号");
+        // 设成 8 位有符号并落盘（此时 lang 仍是中文，写盘安全）
+        for c in app.channels.iter_mut() {
+            c.idx_text = "2".into();
+            c.sig_text = "15".into();
+        }
+        app.apply_channel_config();
+        assert_eq!(app.channel_info_text(), "8位有符号");
+        // 下面只在内存里切语言读文本，绝不 apply——apply 会把 En 写进共享
+        // .config.json，并行测试读到后全乱（曾致 2 个无关用例失败）。
+        app.lang = Lang::En;
+        assert_eq!(app.channel_info_text(), "8sig");
+        app.engine.channels[0].sign_bit = -1;
+        app.engine.channels[1].sign_bit = -1;
+        assert_eq!(app.channel_info_text(), "8unsig");
+        app.lang = Lang::Zh; // 纯内存复位，不写盘
     }
 
     /// 回环造帧：帧头拼接 + 00 填充 + 末字节循环码递增。
@@ -3359,15 +4448,27 @@ mod layout_tests {
         // 停止后：回落到普通回执
         app.cmd_loop = false;
         assert_eq!(app.status_cells()[9], tr(app.lang, "cycle_reset_done"));
-        // 回执过期（手动把时间戳拨到 4 秒前）：最近操作格恢复 —
+        // 回执过期（手动把时间戳拨到 4 秒前）：最近操作格回落到空闲轮播提示
         app.status_msg_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
-        assert_eq!(app.status_cells()[9], "—");
+        let r = app.status_cells()[9].clone();
+        assert!(
+            STATUS_TIP_KEYS.iter().any(|k| tr(app.lang, k) == r),
+            "过期后应回落轮播提示: {:?}",
+            r
+        );
     }
 
     /// 🗑 清空绘图：TX 与帧计数一起归 0（防止只清一半），快照也清空。
     #[test]
     fn clear_plot_resets_tx_and_frame_count() {
         let mut app = FrameApp::new();
+        // 并行测试会共享 .config.json，显式设一套合法帧配置，避免 clear_plot 内
+        // build_engine() 因并发写出的临时错误配置而失败（测试隔离）。
+        app.header_text = String::new();
+        app.length_text = "4".into();
+        app.samples_text = "1".into();
+        app.max_points_text = "500".into();
+        app.cycle_pos_text = String::new();
         app.tx_count = 42;
         app.engine.frame_count = 7;
         app.engine.checksum_errors = 3;
@@ -3381,6 +4482,1016 @@ mod layout_tests {
             app.plot_snapshot_vals.is_empty() && app.plot_snapshot_dif.is_empty(),
             "清空绘图应清掉暂停快照"
         );
+    }
+
+    // ===== 数据验算 =====
+
+    /// 验算用引擎：帧头 EB 90、帧长 4、循环码在最后一字节（0-based 3）、8 位无校验；
+    /// CH1 读字节 2..3 = 帧序号本身（大端 0x00XX），便于断言快照数值。
+    fn verify_engine() -> Engine {
+        let chans = vec![ChannelCfg {
+            indices: vec![2, 3],
+            sign_bit: -1,
+            active: true,
+        }];
+        Engine::with_cycle(
+            vec![0xEB, 0x90],
+            4,
+            1,
+            true,
+            chans,
+            false,
+            ChecksumMode::None,
+            Some(3),
+            8,
+        )
+    }
+
+    fn codes_hex(codes: &[u8]) -> String {
+        let mut s = String::new();
+        for &c in codes {
+            s.push_str(&format!("EB 90 00 {:02X} ", c));
+        }
+        s
+    }
+
+    fn run_verify(codes: &[u8]) -> Vec<VerifyAnomaly> {
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(codes_hex(codes).as_bytes());
+        r.finish()
+    }
+
+    #[test]
+    fn verify_normal_and_wrap_no_anomaly() {
+        // 0..=255 再回 0：255→0 是自然回绕，不得误报。
+        let mut codes: Vec<u8> = (0..=255).collect();
+        codes.extend_from_slice(&[0, 1, 2]);
+        let a = run_verify(&codes);
+        assert!(a.is_empty(), "正常递增+回绕不应报异常: {:?}", a);
+    }
+
+    #[test]
+    fn verify_jump_records_expected_actual_lost() {
+        // 0,1,2 后跳到 5：期望 3、实际 5、丢 2 帧。
+        let a = run_verify(&[0, 1, 2, 5, 6]);
+        assert_eq!(a.len(), 1, "应恰好一条异常");
+        assert_eq!(a[0].frame_no, 4);
+        assert_eq!(a[0].expected, 3);
+        assert_eq!(a[0].actual, 5);
+        assert_eq!(a[0].lost, 2);
+    }
+
+    #[test]
+    fn verify_chunk_boundary_keeps_bytes() {
+        // 按 1 字节喂入，故意把每个两字符 hex 拆到不同块；结果必须与整块一致。
+        let codes = [0u8, 1, 2, 5, 6];
+        let text = codes_hex(&codes);
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        for &b in text.as_bytes() {
+            r.feed(&[b]);
+        }
+        let a = r.finish();
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].frame_no, a[0].expected, a[0].actual, a[0].lost), (4, 3, 5, 2));
+    }
+
+    #[test]
+    fn verify_snapshot_captures_max_window() {
+        // 帧 1..100 正常 0..99；帧 101 跳到 103；之后继续 104..（共 197 帧）。
+        let mut codes: Vec<u8> = (0..100).collect();
+        codes.push(103);
+        codes.extend((104..200u8).collect::<Vec<_>>());
+        let a = run_verify(&codes);
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].frame_no, a[0].expected, a[0].actual, a[0].lost), (101, 100, 103, 3));
+        let snap = a[0].snapshot.as_ref().expect("应存下快照");
+        assert_eq!(snap.len(), 1, "只有 1 个通道");
+        // 数据总长 197 < 2*MAX+1，快照保留全部可用帧（UI 再按前/后 N 帧截取）。
+        assert_eq!(snap[0].len(), 197);
+        assert_eq!(a[0].snap_center, 100, "异常帧 101 在快照中的下标为 100");
+        // 中心（index 100）= 异常帧 101；前一帧 100 = 99；后一帧 102 = 104。
+        assert_eq!(snap[0][99], 99);
+        assert_eq!(snap[0][100], 103);
+        assert_eq!(snap[0][101], 104);
+    }
+
+    #[test]
+    fn verify_three_buttons_fit_left_panel() {
+        let ctx = egui::Context::default();
+        let mut app = FrameApp::new();
+        app.style.left_panel_width = 300.0;
+        // 三按钮行内 #[cfg(test)] 断言会在两语言下逐一检查文案宽度不超载。
+        for lang in [Lang::Zh, Lang::En] {
+            app.lang = lang;
+            run_frames(&mut app, &ctx, 4);
+        }
+        assert!(
+            app.last_panel_width <= 302.0,
+            "三按钮不应撑宽左栏: width={}",
+            app.last_panel_width
+        );
+    }
+
+    /// 「原始数据绘图」过滤器不得含 csv（CSV 不是原始数据.txt）。
+    #[test]
+    fn offline_filter_excludes_csv() {
+        assert!(
+            !OFFLINE_TEXT_EXTS.contains(&"csv"),
+            "原始数据绘图过滤器不应含 csv: {:?}",
+            OFFLINE_TEXT_EXTS
+        );
+        assert!(OFFLINE_TEXT_EXTS.contains(&"txt"));
+        assert!(OFFLINE_TEXT_EXTS.contains(&"hex"));
+        assert!(OFFLINE_TEXT_EXTS.contains(&"log"));
+    }
+
+    /// CSV 文本走分析入口时给友好提示，不暴露底层 hex 解析报错；中英都要对。
+    #[test]
+    fn offline_csv_text_friendly_status() {
+        let mut app = FrameApp::new();
+        let csv = "Frame,CH1,CH2\n1,10,20\n2,11,21\n";
+        for lang in [Lang::Zh, Lang::En] {
+            app.lang = lang;
+            app.analyze_hex_string(csv);
+            assert_eq!(
+                app.status_msg,
+                tr(lang, "offline_csv_unsupported"),
+                "CSV 应给友好提示（{:?}）",
+                lang
+            );
+            assert!(
+                !app.status_msg.contains("invalid digit"),
+                "不能暴露底层 hex 报错: {}",
+                app.status_msg
+            );
+        }
+        // 带 BOM 的表头同样识别。
+        app.analyze_hex_string("\u{feff}Frame,CH1\n1,2\n");
+        assert_eq!(app.status_msg, tr(app.lang, "offline_csv_unsupported"));
+    }
+
+    /// 真实帧号坐标：series x 基准 = frame_no - snap_center，异常点 x = 真实帧号；
+    /// x_bounds 以 frame_no 为中心（左右各 50），marker_x = frame_no。
+    #[test]
+    fn verify_real_frame_number_coordinates() {
+        // 第 41 帧、前面 40 帧 → center=40 → x 基准=1，第 i 点 x=1+i，异常点 x=41。
+        let (frame_no, center) = (41u64, 40usize);
+        let base = verify_real_x_base(frame_no, center);
+        assert_eq!(base, 1.0, "x 基准应为 frame_no - snap_center");
+        assert_eq!(base + center as f64, frame_no as f64, "异常点应落在真实帧号 x=41");
+        assert_eq!(base + (center - 1) as f64, 40.0, "异常点前一点应是真实帧号 40");
+        assert_eq!(base + (center + 1) as f64, 42.0, "异常点后一点应是真实帧号 42");
+        // x_bounds=[-9,91]，中心恰为 41，异常点仍严格居中。
+        let bounds = verify_x_bounds(frame_no, 50, 50);
+        assert_eq!(bounds, [-9.0, 91.0]);
+        assert_eq!((bounds[0] + bounds[1]) * 0.5, frame_no as f64, "x 范围应以帧号居中");
+        // marker_x 就是真实帧号，且与 x 范围中心一致（红圈与居中不冲突）。
+        let marker_x = frame_no as f64;
+        assert_eq!(marker_x, 41.0, "marker_x 应为真实帧号 41");
+        assert_eq!(marker_x, (bounds[0] + bounds[1]) * 0.5, "marker_x 与 x 范围中心一致");
+
+        // 边界帧：第 5 帧、center=4 → x 基准=1，点 x=1..5，异常点 x=5。
+        let base5 = verify_real_x_base(5, 4);
+        assert_eq!(base5, 1.0);
+        assert_eq!(base5 + 4.0, 5.0, "边界帧异常点落在真实帧号 5");
+        let bounds5 = verify_x_bounds(5, 50, 50);
+        assert_eq!(bounds5, [-45.0, 55.0], "下界可负（虚拟位置），不 clamp 以保持居中");
+        assert_eq!((bounds5[0] + bounds5[1]) * 0.5, 5.0);
+
+        // 首帧：第 1 帧、center=0 → x 基准=1，异常点 x = base1 + 0 = 1。
+        let base1 = verify_real_x_base(1, 0);
+        assert_eq!(base1, 1.0, "首帧 x 基准 = 1 - 0 = 1");
+        assert_eq!(base1 + 0.0, 1.0, "首帧异常点 x=1");
+        assert_eq!(verify_x_bounds(1, 50, 50), [-49.0, 51.0]);
+
+        // 满 101 帧窗口：frame=100、center=50 → x 基准=50，点 x=50..150。
+        let base100 = verify_real_x_base(100, 50);
+        assert_eq!(base100, 50.0);
+        assert_eq!(base100 + 50.0, 100.0, "满窗口异常点 x=真实帧号");
+        assert_eq!(base100 + 100.0, 150.0);
+        assert_eq!(verify_x_bounds(100, 50, 50), [50.0, 150.0], "满窗口无负坐标");
+    }
+
+    /// 快照中立异常点下标：开头/中段不足 101 帧时都取到真实位置，不是写死 50。
+    #[test]
+    fn verify_snapshot_center_index_at_edges() {
+        // 第 2 帧就跳变：前面只有 1 帧 → center=1。
+        let a = run_verify(&[0, 5]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].frame_no, 2);
+        assert_eq!(a[0].snap_center, 1);
+        // 第 5 帧跳变：前面 4 帧 → center=4。
+        let a = run_verify(&[0, 1, 2, 3, 8]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].frame_no, 5);
+        assert_eq!(a[0].snap_center, 4);
+        let snap = a[0].snapshot.as_ref().unwrap();
+        assert_eq!(snap[0].len(), a[0].snap_center + 1, "开头处快照到异常点为止");
+        assert_eq!(snap[0][a[0].snap_center], 8, "异常点应是跳变后的实际值");
+        // 中段 41 帧跳变：前面 40 帧 → center=40。
+        let mut codes: Vec<u8> = (0..40).collect();
+        codes.push(45);
+        let a = run_verify(&codes);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].frame_no, 41);
+        assert_eq!(a[0].snap_center, 40);
+    }
+
+    /// 三按钮同款：源码静态检查，按钮行不得有 accent / 白字特殊分支。
+    #[test]
+    fn three_buttons_have_no_accent_branch() {
+        let src = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let start = src
+            .find("原始数据绘图 | 剪贴板绘图 | 数据验算")
+            .expect("应找到三按钮行注释");
+        let end = src[start..]
+            .find("/// 左栏组 4")
+            .expect("应找到下一组注释")
+            + start;
+        let row = &src[start..end];
+        assert!(!row.contains("if i == 2"), "三按钮不应有 i==2 特殊分支");
+        assert!(!row.contains(".fill(accent)"), "三按钮不应有 accent 填充");
+        // 注意：#[cfg(test)] 的宽度断言里也用 Color32::WHITE 量文本，不能据此判断按钮样式。
+    }
+
+    /// 验算快照图：首尾补真实帧号边界点后自动边界覆盖全窗口，异常点仍在真实帧号且居中。
+    #[test]
+    fn verify_plot_points_padded_and_center_kept() {
+        use crate::ui::plot::pad_points_to_x_range;
+        // 模拟第 5 帧、center=4：x0=1，5 个点 x=1..5（异常点 x=5，y=8）。
+        let frame_no = 5u64;
+        let base = verify_real_x_base(frame_no, 4);
+        let pts: Vec<[f64; 2]> = (0..5)
+            .map(|i| [base + i as f64, (4 + i) as f64])
+            .collect();
+        assert_eq!(pts.first().unwrap()[0], 1.0);
+        assert_eq!(pts.last().unwrap(), &[5.0, 8.0]);
+        let bounds = verify_x_bounds(frame_no, 50, 50); // [-45, 55]
+        let padded = pad_points_to_x_range(&pts, bounds);
+        assert_eq!(padded.first().unwrap()[0], -45.0, "首点应补到 frame-50=-45");
+        assert_eq!(padded.last().unwrap()[0], 55.0, "末点应补到 frame+50=55");
+        assert_eq!(padded.first().unwrap()[1], 4.0, "首补点 y 取通道首值");
+        assert_eq!(padded.last().unwrap()[1], 8.0, "末补点 y 取通道末值");
+        // 异常点（真实帧号 x=5，y=8）仍在，且是 x 范围的中心。
+        let center_pt = padded.iter().find(|p| p[0] == frame_no as f64).unwrap();
+        assert_eq!(*center_pt, [5.0, 8.0], "异常点必须在真实帧号 x=5 且 y 不变");
+        assert_eq!((bounds[0] + bounds[1]) * 0.5, frame_no as f64, "异常点严格居中");
+        assert!(padded.len() >= pts.len() + 2);
+        // 已经铺满 [frame-50, frame+50] 时不再重复补点。
+        let full: Vec<[f64; 2]> = (50..=150).map(|x| [x as f64, 1.0]).collect();
+        assert_eq!(pad_points_to_x_range(&full, [50.0, 150.0]).len(), full.len());
+    }
+
+    /// 静态回归：验算图不得在闭包内 set_plot_bounds（会锁死 Y 并抢走缩放），
+    /// 且必须传 show_points=true、真实帧号 marker_x、以帧号居中的 x_bounds。
+    #[test]
+    fn verify_plot_no_forced_bounds_and_shows_points() {
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        assert!(
+            !plot.contains("[lo, b.min()[1]]"),
+            "不得在闭包内 set_plot_bounds 锁住默认 Y=-1~0"
+        );
+        assert!(
+            plot.contains("pad_points_to_x_range"),
+            "应改用首尾补边界点让自动边界覆盖窗口"
+        );
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        assert!(
+            app.contains("true, // 像主图暂停那样叠加实心数据点"),
+            "验算快照图必须 show_points=true"
+        );
+        assert!(
+            app.contains("Some((a.frame_no as f64, marker_ys))"),
+            "验算快照图必须在真实帧号标出异常点大红圈"
+        );
+        assert!(
+            app.contains("Some(verify_x_bounds(a.frame_no, before, after))"),
+            "x_bounds 必须以真实帧号为中心且按用户设置的前/后帧数变化"
+        );
+        // 只检查生产代码区（测试源码里也写了这个字面量用于断言，不能算进来）。
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        assert!(
+            !prod.contains("Some([-50.0, 50.0])"),
+            "不得再使用相对坐标的固定 [-50,50] 范围"
+        );
+    }
+
+    /// 结论提示：「未发现丢帧」与「发现 N 处异常」同样加粗 + 同字号；
+    /// 非法字符提示优先于「未发现丢帧」，中英文都一致。
+    #[test]
+    fn verify_no_loss_heading_is_prominent() {
+        let app_src = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app_src[..app_src.find("mod layout_tests").expect("应找到测试模块")];
+        assert!(prod.contains(".strong()"), "结论提示必须加粗");
+        assert!(prod.contains(".size(VERIFY_HEADING_SIZE)"), "结论提示必须大字号");
+
+        for lang in [Lang::Zh, Lang::En] {
+            assert_eq!(
+                verify_result_hint(lang, false, 0),
+                Some((tr(lang, "verify_no_loss").to_string(), false)),
+                "干净数据无异常才显示未发现丢帧"
+            );
+            let invalid = Some((tr(lang, "verify_invalid_data").to_string(), true));
+            assert_eq!(
+                verify_result_hint(lang, true, 0),
+                invalid,
+                "乱码无异常时必须显示非法字符，不能说未发现丢帧"
+            );
+            assert_eq!(
+                verify_result_hint(lang, true, 3),
+                invalid,
+                "乱码即使切出异常也应以非法字符提示为主"
+            );
+            assert_eq!(
+                verify_result_hint(lang, false, 3),
+                None,
+                "干净数据有异常走「发现 N 处异常」标题"
+            );
+        }
+    }
+
+    /// 非法字符检测：乱码（含非 hex 字母）必须置标志，干净/含空白/BOM 数据不得误报。
+    #[test]
+    fn verify_invalid_char_detection() {
+        // 乱码：fadfdsa / sa 里有非 hex 的 s；不能静默跳过。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(b"eb 90 fadfdsafdsafdsa\nfdsa\nsa\n");
+        assert!(r.has_invalid_char, "含非 hex 字符的乱码必须记录非法标志");
+
+        // 干净纯 hex（带帧头，codes_hex 生成空格分隔）不误报。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(codes_hex(&[0, 1, 2, 5, 6]).as_bytes());
+        assert!(!r.has_invalid_char, "纯 hex 数据不得误报");
+
+        // 空格/制表/回车/换行都是合法分隔，不算非法。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(b"\tEB\r\n90 00 01\t02\n");
+        assert!(!r.has_invalid_char, "空白分隔不得误报");
+
+        // 文件头 UTF-8 BOM 合法。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(b"\xef\xbb\xbfEB 90 00 01");
+        assert!(!r.has_invalid_char, "BOM 不得误报");
+
+        // 0x 前缀：x 非 hex，现有格式是纯 hex 空格分隔，按非法处理。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(b"0xEB 0x90");
+        assert!(r.has_invalid_char, "0x 前缀的 x 按非法字符处理");
+
+        // 末尾落单的半字节（单独一个 f）数据不完整，finish 时也要记非法。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(b"EB 90 0");
+        let (_, invalid) = r.finish_with_status();
+        assert!(invalid, "末尾落单半字节应视为数据不完整");
+
+        // 干净数据 finish 后仍为 false。
+        let mut r = VerifyRunner::new(verify_engine(), 200);
+        r.feed(codes_hex(&[0, 1]).as_bytes());
+        let (_, invalid) = r.finish_with_status();
+        assert!(!invalid);
+    }
+
+    /// 按钮改名 + 字号：analyze_clip 改为「剪贴板绘图」，三按钮字号 11pt 且渲染/断言共用同一常量。
+    #[test]
+    fn analyze_clip_label_and_button_font_size() {
+        let i18n = std::fs::read_to_string("src/ui/i18n.rs").expect("应能读到 i18n.rs");
+        assert!(
+            i18n.contains("(\"analyze_clip\", \"剪贴板绘图\", \"Clipboard Plot\")"),
+            "剪贴板按钮文案应改为「剪贴板绘图」"
+        );
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        assert!(prod.contains("const OFFLINE_BTN_FONT_SIZE: f32 = 11.0;"));
+        assert!(prod.contains(".size(OFFLINE_BTN_FONT_SIZE)"), "按钮渲染应使用该字号");
+        assert!(
+            prod.contains("FontId::proportional(OFFLINE_BTN_FONT_SIZE)"),
+            "宽度断言必须与渲染同字号"
+        );
+    }
+
+    /// 补点不可见：边界点只进全透明辅助线撑开自动边界，可见曲线只用真实点；
+    /// 不用 NaN 断线（egui_plot 0.29 的 Line::shapes 不过滤 NaN 顶点）。
+    #[test]
+    fn verify_padding_points_are_invisible() {
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        assert!(plot.contains("Color32::TRANSPARENT"), "补点辅助线必须全透明");
+        assert!(
+            plot.contains("let pts = raw;"),
+            "可见曲线/数据点必须只用真实点，不画补点"
+        );
+        assert!(
+            plot.contains("pad_points_to_x_range(&raw, range)"),
+            "辅助线仍用补点撑开坐标范围"
+        );
+    }
+
+    /// 前后帧数：默认 50，clamp 到 1..=500。
+    #[test]
+    fn verify_frames_from_text_default_and_clamp() {
+        assert_eq!(verify_frames_from_text("50"), 50);
+        assert_eq!(verify_frames_from_text(""), 50, "空值回退默认 50");
+        assert_eq!(verify_frames_from_text("abc"), 50, "非法回退默认 50");
+        assert_eq!(verify_frames_from_text("0"), 50, "0 非法回退默认 50");
+        assert_eq!(verify_frames_from_text("1"), 1, "下限 1");
+        assert_eq!(verify_frames_from_text("20"), 20);
+        assert_eq!(verify_frames_from_text("500"), 500, "上限 500");
+        assert_eq!(verify_frames_from_text("501"), 500, "超过上限 clamp 到 500");
+        assert_eq!(verify_frames_from_text("99999"), 500);
+    }
+
+    /// 可变窗口：x_bounds 按前/后帧数变化，异常点 x 仍是真实帧号；快照截取与边界帧正确。
+    #[test]
+    fn verify_variable_window_bounds_and_slice() {
+        let b = verify_x_bounds(41, 20, 30);
+        assert_eq!(b, [21.0, 71.0], "前 20 后 30 → [frame-20, frame+30]");
+        // 前后不等时异常点不必是 x 范围绝对正中，但 x 必须等于真实帧号。
+        assert!(b[0] < 41.0 && b[1] > 41.0);
+        let d = verify_x_bounds(41, 50, 50);
+        assert_eq!(d, [-9.0, 91.0]);
+        assert_eq!((d[0] + d[1]) * 0.5, 41.0, "默认 50/50 时严格居中");
+
+        // 快照按最大窗口存 100 点、center=50；前 10 后 20 → 片段 40..70，新中心 10。
+        let snap: Vec<Vec<i64>> = vec![(0..100).map(|i| i as i64).collect()];
+        let (view, center) = verify_slice_snapshot(&snap, 50, 10, 20);
+        assert_eq!(view[0].len(), 31);
+        assert_eq!(view[0].first(), Some(&40));
+        assert_eq!(view[0].last(), Some(&70));
+        assert_eq!(center, 10);
+        assert_eq!(
+            verify_real_x_base(41, center) + center as f64,
+            41.0,
+            "截取后异常点仍在真实帧号"
+        );
+        // 边界帧：前 20 帧不足时从 0 截起，新中心随之调整。
+        let (view2, center2) = verify_slice_snapshot(&snap, 5, 20, 20);
+        assert_eq!(view2[0].first(), Some(&0));
+        assert_eq!(center2, 5);
+        // 空快照不 panic。
+        let (empty, c) = verify_slice_snapshot(&[], 0, 50, 50);
+        assert!(empty.is_empty());
+        assert_eq!(c, 0);
+    }
+
+    /// 未配置循环码时必须提示去帧配置填写，不能显示「未发现丢帧」。
+    #[test]
+    fn verify_no_cycle_config_shows_guide_not_no_loss() {
+        let mut app = FrameApp::new();
+        app.cycle_pos_text.clear();
+        app.start_verify(std::path::PathBuf::from("no-such-file.txt"));
+        let st = app.verify.as_ref().expect("应弹出验算窗口");
+        assert!(!st.running, "不应启动后台验算");
+        assert!(st.anomalies.is_empty());
+        assert_eq!(st.msg, tr(app.lang, "verify_no_cycle"));
+        assert_ne!(
+            st.msg,
+            tr(app.lang, "verify_no_loss"),
+            "无循环码配置时绝不能说「未发现丢帧」"
+        );
+        assert_eq!(verify_frames_from_text(&st.before_text), 50);
+        assert_eq!(verify_frames_from_text(&st.after_text), 50);
+    }
+
+    /// 验算图高度：由整窗高度直接计算（右栏顶部无横条占位），下限为绘图正方形 580，无上限。
+    #[test]
+    fn verify_plot_height_adapts_to_window() {
+        assert_eq!(verify_plot_height(1000.0), 1000.0, "底层高度不留余量，绘图底边贴弹窗底边");
+        assert_eq!(verify_plot_height(10.0), VERIFY_PLOT_MIN_SIZE, "下限为绘图正方形边长");
+        // 从整窗内容高度算：拖到 1000 图高 972（减 28px 顶部开销）；小窗守住 580。
+        assert_eq!(verify_plot_height_from_window(1000.0), 972.0, "弹窗拖大图同步变高，无上限");
+        assert_eq!(verify_plot_height_from_window(400.0), VERIFY_PLOT_MIN_SIZE, "小窗守住正方形下限");
+        assert_eq!(verify_plot_height_from_window(100.0), VERIFY_PLOT_MIN_SIZE);
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let call = prod.find("\"verify_plot\"").expect("应找到验算图调用");
+        let call_tail = &prod[call..call + 700];
+        assert!(
+            call_tail.contains("verify_plot_height_from_window(window_h)"),
+            "验算图高度必须由整窗高度算，不受嵌套 Ui 受限的 available_height 影响"
+        );
+        assert!(
+            !call_tail.contains("right.available_height()"),
+            "不得再从 right.available_height() 取高度（会卡在极限）"
+        );
+        assert!(
+            !call_tail.contains("260.0"),
+            "验算图高度不得再写死 260.0"
+        );
+    }
+
+    /// 绘图区最小边长 >= 两个「异常帧：第 3943 帧（图中红线）」文字长度（截图约 287px × 2）。
+    #[test]
+    fn verify_plot_min_size_covers_two_frame_labels() {
+        const FRAME_LABEL_W: f32 = 287.0;
+        assert!(
+            VERIFY_PLOT_MIN_SIZE >= 2.0 * FRAME_LABEL_W,
+            "绘图下限须 >= 两个异常帧红字长度，否则红字会竖排/图被挤成竖线"
+        );
+        assert!(
+            (560.0..=580.0).contains(&VERIFY_PLOT_MIN_SIZE),
+            "最小边长应落在 560~580 区间"
+        );
+    }
+
+    /// 验算图关掉实心背景（透出半透明窗口底板），主图保留背景；函数签名不变。
+    #[test]
+    fn verify_plot_background_only_off_for_verify() {
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        assert!(
+            plot.contains(".show_background(id_base != \"verify_plot\")"),
+            "验算图须关极端底色实心矩形，主图 data_plot 须保留背景"
+        );
+        assert!(
+            plot.contains("fn draw_plot_with_id(") && plot.contains("id_base: &str"),
+            "不得改函数签名（主图调用与 &mut reset 静态断言依赖它）"
+        );
+    }
+
+    /// 坐标轴与异常图例中文化：从 i18n 取词条，主图与验算图都跟随界面语言。
+    #[test]
+    fn verify_plot_labels_follow_language() {
+        use crate::ui::i18n::{tr, Lang};
+        assert_eq!(tr(Lang::Zh, "plot_x_label"), "帧号");
+        assert_eq!(tr(Lang::En, "plot_x_label"), "Frame Number");
+        assert_eq!(tr(Lang::Zh, "plot_y_label"), "数值");
+        assert_eq!(tr(Lang::En, "plot_y_label"), "Value");
+        assert_eq!(tr(Lang::Zh, "plot_anomaly"), "异常点");
+        assert_eq!(tr(Lang::En, "plot_anomaly"), "Anomaly");
+
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        assert!(!plot.contains(".x_axis_label(\"Frame Number\")"), "横轴不得写死英文");
+        assert!(!plot.contains(".y_axis_label(\"Value\")"), "纵轴不得写死英文");
+        assert!(!plot.contains(".name(\"Anomaly\")"), "图例名不得写死英文");
+        for key in ["plot_x_label", "plot_y_label", "plot_anomaly"] {
+            assert!(plot.contains(&format!("tr(lang, \"{}\")", key)), "须用 lang 取 {}", key);
+        }
+        assert!(plot.contains("lang: Lang"), "两个绘图函数都要带 lang 参数");
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        for needle in [
+            "crate::ui::plot::draw_plot_with_id(",
+            "crate::ui::plot::draw_plot(",
+        ] {
+            let pos = app.find(needle).expect("应找到绘图调用");
+            let tail: String = app[pos..].lines().take(16).collect::<Vec<_>>().join("\n");
+            assert!(tail.contains("self.lang"), "{} 调用须传 self.lang", needle);
+        }
+    }
+
+    /// 标题行滑块是短控件（不撑满）、无字样无数字；前后帧短框和清单保持原样。
+    #[test]
+    fn verify_left_column_layout_reverted_with_slider_in_title_row() {
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let start = prod.find("fn verify_window(").expect("应找到 verify_window");
+        let end = prod.find("// ============ 面板绘制").expect("应找到面板绘制分界");
+        let win = &prod[start..end];
+        // 滑块是普通 ui.add 短控件，不再 add_sized 撑满。
+        assert_eq!(
+            win.matches(".show_value(false)").count(),
+            2,
+            "两处滑块都不显示 100% 数字"
+        );
+        assert_eq!(
+            win.matches("tr(self.lang, \"verify_opacity\")").count(),
+            0,
+            "界面不再渲染「透明度/Opacity」字样"
+        );
+        assert_eq!(win.matches("egui::Slider::new(").count(), 2, "滑块须只在两处标题行");
+        for key in ["verify_invalid_data", "verify_found"] {
+            let needle = format!("tr(self.lang, \"{}\")", key);
+            let pos = win.find(&needle).expect("应找到标题词条");
+            let tail: String = win[pos..].lines().take(16).collect::<Vec<_>>().join("\n");
+            assert!(tail.contains("egui::Slider::new("), "{} 标题行须带滑块", key);
+            assert!(tail.contains("show_value(false)"), "{} 标题行滑块须隐藏数字", key);
+            assert!(!tail.contains("add_sized("), "{} 标题行滑块不得撑满", key);
+            assert!(!tail.contains("verify_opacity"), "{} 标题行不得有字样", key);
+        }
+        // 前后帧行仍是两个 44.0 短框，清单仍按文字宽，二者都不撑满。
+        assert_eq!(
+            win.matches("TextEdit::singleline(&mut state.before_text).desired_width(44.0)").count(),
+            1
+        );
+        assert_eq!(
+            win.matches("TextEdit::singleline(&mut state.after_text).desired_width(44.0)").count(),
+            1
+        );
+        assert!(
+            win.contains("ui.selectable_label(state.selected == Some(i), line).clicked()"),
+            "清单须保持按文字宽的 selectable_label"
+        );
+    }
+
+    /// 可拖动分隔线：默认 160（= 拖动下限）、clamp 到 [160, total-260]、配置缺省回退 160、松手持久化。
+    #[test]
+    fn verify_split_width_default_clamp_and_persist() {
+        assert_eq!(VERIFY_SPLIT_DEFAULT, 160.0, "默认左栏取拖动下限 160");
+        assert_eq!(VERIFY_SPLIT_DEFAULT, VERIFY_SPLIT_MIN, "默认即最小极限");
+        assert_eq!(default_verify_split_w(), 160.0, "老配置缺字段时回退 160");
+        assert_eq!(verify_split_width(904.0, 160.0), 160.0);
+        assert_eq!(verify_split_width(904.0, 1000.0), 644.0, "上限 total-260，保住绘图区");
+        assert_eq!(verify_split_width(904.0, 20.0), 160.0, "下限 160");
+        assert_eq!(verify_split_width(300.0, 160.0), 160.0, "窗口过窄时下限优先");
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let win = &prod[prod.find("fn verify_window(").unwrap()..];
+        assert!(win.contains("egui::Sense::drag()"), "分隔条须可拖动");
+        assert!(win.contains("sep_resp.drag_delta().x"), "拖动增量改左栏宽度");
+        assert!(win.contains("self.verify_split_w = verify_split_width("), "拖动后须 clamp");
+        assert!(
+            win.contains("sep_resp.drag_stopped()") && win.contains("self.save_config()"),
+            "松手须持久化，不能每帧写文件"
+        );
+        assert!(
+            prod.contains("verify_split_w: self.verify_split_w,"),
+            "save_config 须写入分隔线位置"
+        );
+        assert!(
+            prod.contains("self.verify_split_w = verify_split_width(920.0, cfg.verify_split_w)"),
+            "load_config 须恢复分隔线位置"
+        );
+        assert!(
+            prod.contains("#[serde(default = \"default_verify_split_w\")]"),
+            "PersistConfig 缺字段时须回退 160"
+        );
+    }
+
+    /// 窗口 min_size 推导约束：min 高 >= 顶部开销 + 绘图下限 + 余量；min 宽 >= 默认左栏
+    /// + 绘图下限 + 分隔 + 内边距；且 min <= default（否则一打开就超限）。
+    #[test]
+    fn verify_window_min_size_constraints() {
+        assert!(
+            VERIFY_WINDOW_MIN_H >= VERIFY_TOP_OVERHEAD + VERIFY_PLOT_MIN_SIZE + 24.0,
+            "min 高须容纳顶部开销 + 绘图下限 + 标题栏/内边距余量"
+        );
+        assert!(
+            VERIFY_WINDOW_MIN_W >= VERIFY_SPLIT_DEFAULT + VERIFY_PLOT_MIN_SIZE + 6.0 + 16.0,
+            "min 宽须容纳默认左栏 + 绘图下限 + 分隔 + 内边距"
+        );
+        assert!(VERIFY_WINDOW_MIN_W <= VERIFY_WINDOW_DEFAULT_W, "min 宽不得大于 default");
+        assert!(VERIFY_WINDOW_MIN_H <= VERIFY_WINDOW_DEFAULT_H, "min 高不得大于 default");
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let win = &prod[prod.find("fn verify_window(").expect("应找到 verify_window")..];
+        assert!(win.contains(".min_size(["), "验算弹窗必须设最小尺寸");
+        assert!(
+            win[..win.find(".show(ctx").unwrap()].contains(".min_size([VERIFY_WINDOW_MIN_W, VERIFY_WINDOW_MIN_H])"),
+            "min_size 必须使用推导常量"
+        );
+    }
+
+    /// 透明度默认值与范围：默认 80，滑块 20..=100，越界值由纯函数 clamp。
+    #[test]
+    fn verify_opacity_default_and_range() {
+        assert_eq!(VERIFY_OPACITY_DEFAULT, 80, "默认 80 一打开就是轻微透");
+        assert_eq!(VERIFY_OPACITY_MIN, 20);
+        assert_eq!(VERIFY_OPACITY_MAX, 100);
+        assert!(
+            VERIFY_OPACITY_DEFAULT > VERIFY_OPACITY_MIN && VERIFY_OPACITY_DEFAULT < VERIFY_OPACITY_MAX
+        );
+        // 越界输入 clamp 到边界：不会让窗口消失，也不会超过 u8 alpha。
+        assert_eq!(verify_opacity_alpha(0), 51, "0 被 clamp 到 20 → 51");
+        assert_eq!(verify_opacity_alpha(255), 255, "255 被 clamp 到 100 → 255");
+    }
+
+    /// 百分比 → alpha 换算正确，且窗口链静态检查：.fill + unpremultiplied + 跟随主题 + 滑块词条。
+    #[test]
+    fn verify_opacity_alpha_mapping_and_window_wiring() {
+        assert_eq!(verify_opacity_alpha(100), 255, "100% 完全不透明，与原观感一致");
+        assert_eq!(verify_opacity_alpha(80), 204, "80% → 204");
+        assert_eq!(verify_opacity_alpha(20), 51, "20% → 51");
+        assert_eq!(verify_opacity_alpha(50), 128, "50% 四舍五入 127.5 → 128");
+        for pct in VERIFY_OPACITY_MIN..=VERIFY_OPACITY_MAX {
+            let a = verify_opacity_alpha(pct);
+            assert!(a >= 51, "alpha 须 >= 51（u8 天然 <= 255），got {}", a);
+        }
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let win = &prod[prod.find("fn verify_window(").expect("应找到 verify_window")..];
+        assert!(
+            win.contains(".frame(egui::Frame::window(&style).fill(verify_fill))"),
+            "egui 0.29 须用 Frame::window(...).fill(...) 设置底板透明度"
+        );
+        assert!(
+            win.contains("egui::Color32::from_rgba_unmultiplied("),
+            "fill 颜色须用 unpremultiplied alpha"
+        );
+        assert!(
+            win.contains("style.visuals.window_fill()"),
+            "底板颜色须跟随当前主题 visuals，不能写死 rgb"
+        );
+        assert!(
+            win.contains("egui::Slider::new(") && win.contains(".show_value(false)"),
+            "透明度滑块须隐藏数字，界面不再显示「透明度」字样"
+        );
+        let i18n = std::fs::read_to_string("src/ui/i18n.rs").expect("应能读到 i18n.rs");
+        assert!(
+            i18n.contains("(\"verify_opacity\", \"透明度\", \"Opacity\")"),
+            "中英词条须齐备，中文不动其它词条"
+        );
+    }
+
+    /// 重置链路全链路：事件置位 → X=[frame-前N, frame+后N] → plot.rs 先设边界再消费标志。
+    #[test]
+    fn verify_reset_chain_full_path() {
+        // 1) 改帧数置位；无事件时保持，不覆盖用户缩放。
+        let mut flag = false;
+        flag |= verify_reset_on_event(false, true, false);
+        assert!(flag, "改前后帧数必须置位");
+        let mut idle = false;
+        idle |= verify_reset_on_event(false, false, false);
+        assert!(!idle, "无事件不得重置，保留用户缩放/拖动");
+
+        // 2) X 边界由帧号与前后帧纯函数决定，换条目/改帧数都走同一函数。
+        assert_eq!(verify_x_bounds(41, 50, 50), [-9.0, 91.0]);
+        assert_eq!(verify_x_bounds(41, 3, 7), [38.0, 48.0]);
+
+        // 3) plot.rs：只有真正算出真实边界才消费标志，空帧不吞掉重置。
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        let reset_at = plot.rfind("if *reset_bounds {").expect("重置分支必须存在");
+        let tail: String = plot[reset_at..]
+            .lines()
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let set_at = tail.find("pui.set_plot_bounds(").expect("重置分支必须设边界");
+        let consume_at = tail.find("*reset_bounds = false;").expect("设边界后须消费标志");
+        assert!(set_at < consume_at, "必须先设边界再消费，空帧不吞重置");
+    }
+
+    /// 三类事件（换异常条目 / 改前后帧数 / 验算完成）都必须置位坐标重置标志，
+    /// 且标志随 VerifyState 存取形成闭环（不再放 FrameApp 上造成链路断点）。
+    #[test]
+    fn verify_reset_bounds_flag_set_on_events() {
+        // 纯函数全组合：任一事件为真即重置，全假才保留缩放。
+        assert!(!verify_reset_on_event(false, false, false));
+        assert!(verify_reset_on_event(true, false, false));
+        assert!(verify_reset_on_event(false, true, false));
+        assert!(verify_reset_on_event(false, false, true));
+        assert!(verify_reset_on_event(true, true, true));
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        // 换异常条目
+        let sel = prod
+            .find("if ui.selectable_label(state.selected == Some(i), line).clicked()")
+            .expect("应找到条目点击分支");
+        // 按行取片段，避免固定字节窗口踩到中文注释的 UTF-8 多字节边界。
+        let sel_tail: String = prod[sel..].lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            sel_tail.contains("state.reset_bounds |= verify_reset_on_event(true, false, false)"),
+            "换异常条目必须置位 state.reset_bounds"
+        );
+        // 改前后帧数输入框
+        let inp = prod
+            .find("if state.before_text != before_prev || state.after_text != after_prev")
+            .expect("应找到前后帧数变化分支");
+        let inp_tail: String = prod[inp..].lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            inp_tail.contains("state.reset_bounds |= verify_reset_on_event(false, true, false)"),
+            "改前后帧数必须置位 state.reset_bounds"
+        );
+        // 验算完成（poll_verify 的 Done 分支）
+        assert!(
+            prod.contains("st.reset_bounds |= verify_reset_on_event(false, false, true)"),
+            "验算完成时必须置位 state.reset_bounds"
+        );
+        // 绘图调用：本帧取用 → 传入 → 写回，闭环不丢。
+        assert!(prod.contains("let mut reset = state.reset_bounds;"), "须从 state 取用标志");
+        assert!(prod.contains("&mut reset,"), "标志须传入 draw_plot_with_id");
+        assert!(prod.contains("state.reset_bounds = reset;"), "绘图后须写回 state");
+        assert!(
+            !prod.contains("self.verify_reset_bounds"),
+            "标志不得留在 FrameApp 上，否则 take()/写回会形成链路断点"
+        );
+    }
+
+    /// 重置帧算出真实边界：截图2 的第 41 帧、前/后各 500 → X=[-459,541]，Y 为数据实际范围。
+    #[test]
+    fn verify_reset_uses_real_data_bounds() {
+        use crate::ui::plot::{bounds_with_y_margin, compute_series_bounds};
+        let frame_no = 41u64;
+        let before = 500usize;
+        let after = 500usize;
+        let bounds = verify_x_bounds(frame_no, before, after);
+        assert_eq!(bounds, [-459.0, 541.0], "截图2 的正确 X 范围");
+
+        let x0 = verify_real_x_base(frame_no, before); // 异常点在快照中的下标为 500
+        let series: Vec<(Option<String>, Vec<f64>, usize, f64)> = vec![(
+            Some("CH1".into()),
+            (0..1001).map(|i| i as f64).collect(),
+            0,
+            x0,
+        )];
+        let real = compute_series_bounds(&series, Some(bounds), Some((frame_no as f64, vec![500.0])));
+        assert_eq!(real, Some([-459.0, 541.0, 0.0, 1000.0]), "真实范围须含辅助点 x 与全部真实 y");
+        let [min, max] = bounds_with_y_margin(real.unwrap());
+        assert_eq!([min[0], max[0]], [-459.0, 541.0], "X 必须严格是 [frame-前N, frame+后N]");
+        assert!(min[1] < 0.0 && max[1] > 1000.0, "Y 才留边距");
+
+        let plot = std::fs::read_to_string("src/ui/plot.rs").expect("应能读到 plot.rs");
+        // 有两个 if *reset_bounds（缩放分支短路 + 末尾真正设边界），取最后一个。
+        let reset_at = plot
+            .rfind("if *reset_bounds {")
+            .expect("重置分支必须存在");
+        let set_at = plot[reset_at..]
+            .find("pui.set_plot_bounds(")
+            .expect("重置分支必须调用 set_plot_bounds");
+        assert!(
+            plot[reset_at..reset_at + set_at].contains("compute_series_bounds"),
+            "重置必须用数据真实范围，不能用 plot_bounds() 默认 Y=-1~0"
+        );
+        // 非重置帧不得设边界：全文件只有两处 set_plot_bounds（缩放复位 + 重置帧）。
+        assert_eq!(
+            plot.matches("pui.set_plot_bounds(").count(),
+            2,
+            "除一次性缩放复位外，只允许重置帧设边界"
+        );
+    }
+
+    /// 结构性回归：验算完成后是「左清单 / 右绘图」；结论/输入横条移入左栏，右栏从弹窗
+    /// 顶部直接开始（顶部无空白），绘图高度由整窗高度算填满右栏；
+    /// running 进度与 msg 提示仍在分栏之外横跨整窗。
+    #[test]
+    fn verify_window_uses_left_list_right_plot_layout() {
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let win = &prod[prod
+            .find("fn verify_window(")
+            .expect("应找到 verify_window")..];
+        assert!(win.contains("ui.horizontal(|ui| {"), "完成后的内容区必须左右两栏");
+        assert!(
+            win.contains("verify_split_width(total_w, self.verify_split_w)"),
+            "分栏宽度须用可拖动的 verify_split_w 经纯函数 clamp 计算"
+        );
+        assert!(
+            win.contains("allocate_ui_with_layout"),
+            "左栏须分配固定宽度，剩余给右栏"
+        );
+
+        let cols = win.find("ui.horizontal(|ui| {").unwrap();
+        let rv = win.find("ui.vertical(|right| {").expect("应找到右栏 vertical");
+        assert!(rv > cols, "右栏 vertical 必须在分栏内");
+        let cols_tail = &win[cols..];
+        assert!(
+            cols_tail.contains("ScrollArea::vertical()"),
+            "左栏必须放可滚动的异常清单"
+        );
+        assert!(
+            cols_tail.contains("auto_shrink([false, false])"),
+            "清单须填满左栏可用高度，条数多少都不影响右栏"
+        );
+        assert!(
+            !cols_tail.contains("max_height(240.0)"),
+            "不得再用固定 240 高度限制清单/绘图"
+        );
+        assert!(
+            cols_tail.contains("verify_plot_height_from_window(window_h)"),
+            "绘图高度须由整窗高度算，填满右栏到底部"
+        );
+        assert!(
+            cols_tail.contains("ui.selectable_label(state.selected == Some(i), line).clicked()"),
+            "点条目更新右栏图的逻辑须保留"
+        );
+
+        // 右栏顶部无空白：整窗结论/输入横条必须在分栏起点与右栏 vertical 之间（即左栏内）。
+        let left_region = &win[cols..rv];
+        for key in ["verify_found", "verify_before", "verify_after"] {
+            assert!(
+                left_region.contains(key),
+                "结论/前后帧输入须移入左栏，否则右栏顶部留大块空白"
+            );
+        }
+        let right_region = &win[rv..];
+        let detail_rel = right_region
+            .find("right.horizontal(|ui| {")
+            .expect("右栏首元素须是 horizontal（说明+红字帧号并一行）");
+        let right_head = &right_region[..detail_rel];
+        assert!(!right_head.contains("TextEdit"), "右栏顶部不得有输入框占位");
+        assert!(!right_head.contains("ui.label"), "右栏顶部不得有多余 label 占位");
+        assert!(
+            right_head.contains("let before = verify_frames_from_text"),
+            "右栏顶部紧接帧数读取与详情，不留空白"
+        );
+        // 并一行结构：这个 horizontal 内须同时含 verify_detail 与 verify_center_frame，
+        // 且红字帧号仍 strong + 红色；防止回退成上下两行。
+        let head_line = &right_region[detail_rel..];
+        let close_rel = head_line.find("});").expect("并一行的 horizontal 须闭合");
+        let head_line = &head_line[..close_rel];
+        assert!(head_line.contains("verify_detail"), "说明文字须在并一行内");
+        assert!(head_line.contains("verify_center_frame"), "红字帧号须在并一行内");
+        assert!(head_line.contains(".strong()"), "帧号须保持 strong");
+        assert!(head_line.contains("0xE0, 0x40, 0x40"), "帧号须保持红色");
+
+        // running / msg 分支在 columns 之前，保持整窗横跨。
+        assert!(win.find("if state.running").unwrap() < cols);
+        assert!(win.find("!state.msg.is_empty()").unwrap() < cols);
+    }
+
+    /// 异常清单：固定描边框包住可滚动列表，条数少时框仍在，条数多时框内滚动；
+    /// 只包清单，不碰上方标题/前后帧输入与右栏绘图。
+    #[test]
+    fn verify_anomaly_list_has_fixed_frame() {
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let win = &prod[prod.find("fn verify_window(").unwrap()..];
+        let frame_at = win.find("egui::Frame::none()").expect("清单须有固定框");
+        let scroll_at = win[frame_at..]
+            .find("ScrollArea::vertical()")
+            .expect("红框内须是可滚动清单");
+        let close_at = win[frame_at..]
+            .find("ui.selectable_label(state.selected == Some(i), line).clicked()")
+            .expect("清单点击逻辑须在框内");
+        assert!(close_at > scroll_at, "点选须发生在红框内的滚动列表里");
+        let frame_part = &win[frame_at..frame_at + scroll_at];
+        assert!(
+            frame_part.contains(".stroke(frame_stroke)"),
+            "框须用描边变量，不再写死红色（红框曾导致缩窗反弹）"
+        );
+        assert!(
+            win[..frame_at].contains("noninteractive.bg_stroke"),
+            "描边色须取自软件统一配色，不再写死红色"
+        );
+        assert!(frame_part.contains(".stroke("), "框须有描边而非仅背景");
+        assert!(
+            frame_part.contains("inner_margin"),
+            "框内留边距，条目文字不能贴着边框"
+        );
+        assert!(
+            win[frame_at..].contains("auto_shrink([false, false])"),
+            "框内清单仍须填满左栏可用高度"
+        );
+        assert!(
+            !win[frame_at..].contains("set_min_height(list_left_h"),
+            "不得再 set_min_height——它会把内容最小高度锁死，导致拖小弹窗松手后反弹"
+        );
+        assert!(
+            win.contains("egui::vec2(list_w, window_h)"),
+            "左栏须用整窗高度定高，不能用会收缩到内容的 ui.available_height()"
+        );
+        // 前后帧输入在框之前，右栏 vertical 在框之后：框不会挤压上方与右栏。
+        let before_at = win.find("TextEdit::singleline(&mut state.before_text)").unwrap();
+        let right_at = win.find("ui.vertical(|right| {").unwrap();
+        assert!(before_at < frame_at && right_at > frame_at, "红框只能夹在输入与右栏之间");
+    }
+
+    /// 状态栏：绘图状态常驻两态且暂停时才醒目动态；空闲轮播快捷提示、不再常驻操作格。
+    #[test]
+    fn status_bar_plot_state_and_idle_tip_rotation() {
+        for lang in [Lang::Zh, Lang::En] {
+            assert!(!tr(lang, "plot_state_live").is_empty(), "实时绘图文案缺失");
+            assert!(!tr(lang, "plot_state_paused").is_empty(), "绘图已暂停文案缺失");
+            assert!(!tr(lang, "chk_no").is_empty(), "无校验文案缺失");
+            // 16 条轮播提示每种语言都须有文案，且两两不同（不是占位符）
+            let mut seen = std::collections::HashSet::new();
+            for k in STATUS_TIP_KEYS {
+                let t = tr(lang, k);
+                assert!(!t.is_empty(), "轮播提示 {} 缺失", k);
+                assert!(seen.insert(t), "轮播提示 {} 文案重复: {}", k, t);
+            }
+        }
+        assert_eq!(STATUS_TIP_KEYS.len(), 16, "用户敲定 16 条轮播提示");
+
+        // 纯函数切换：0/1/2 秒同一条，3 秒换下一条，3*len 回绕。
+        let n = STATUS_TIP_KEYS.len();
+        assert_eq!(status_tip_index(0, n), 0);
+        assert_eq!(status_tip_index(2, n), 0);
+        assert_eq!(status_tip_index(3, n), 1);
+        assert_eq!(status_tip_index(6, n), 2);
+        assert_eq!(status_tip_index((STATUS_TIP_SECS * n as u64) as u64, n), 0, "轮播须回绕");
+        assert_eq!(status_tip_index(7, 0), 0, "空列表不 panic");
+
+        let app = std::fs::read_to_string("src/ui/app.rs").expect("应能读到 app.rs");
+        let prod = &app[..app.find("mod layout_tests").expect("应找到测试模块")];
+        let line = &prod[prod.find("fn status_line(").unwrap()..prod.find("fn draw_plot_state(").unwrap()];
+        let state_at = line.find("self.draw_plot_state(ui, plot_state_w, h)").expect("须有绘图状态格");
+        let light_at = line.find("self.draw_record_light(ui, light_w, h)").expect("须有记录灯");
+        assert!(state_at < light_at, "绘图状态须在「未记录」灯前面");
+        assert!(!line.contains("plot_op_hint"), "TX 前的常驻操作提示格须去掉，改为最近操作格空闲轮播");
+        assert!(line.contains("RECENT_MAX_W"), "最近操作格须设宽度上限，超长回执不撑爆 TX");
+        assert!(line.contains("request_repaint_after"), "空闲轮播须定时请求重绘才能切换");
+        assert!(line.contains("egui::Color32::from_gray(120)"), "轮播提示须用更淡的灰");
+
+        let state_fn = &prod[prod.find("fn draw_plot_state(").unwrap()..];
+        assert!(state_fn.contains("self.plot_paused"), "状态须取自真实暂停标志");
+        assert!(state_fn.contains("request_repaint()"), "暂停呼吸须持续请求重绘");
+        assert!(state_fn.contains("ui.input(|i| i.time)"), "呼吸须由时间驱动");
+    }
+
+    /// 用户实测：非法数据触发的解析错误回执曾把整串原文塞进状态栏撑爆 TX；
+    /// 现在只显示固定短句，且不带 `{}`（不会再嵌入原始输入）。
+    #[test]
+    fn parse_error_receipt_is_short_and_drops_raw_input() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = tr(lang, "offline_parse_err");
+            assert!(!t.contains("{}"), "错误短句不得再带占位符: {}", t);
+            assert!(t.len() <= 60, "错误短句须足够短: {}", t);
+        }
+        // fmt_str 对无固定槽的模板应原样返回，不追加原文。
+        let short = tr(Lang::Zh, "offline_parse_err");
+        assert_eq!(fmt_str(short, "的萨芬沙发上放大发v\nnaaaaaaaaaaaa"), short);
     }
 
 }
